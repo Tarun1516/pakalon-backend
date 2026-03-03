@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pakalon-backend"
+version = "0.1.0"
+description = "Pakalon — AI-Powered CLI Code Editor — Backend API"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "alembic>=1.14.0",
+    "psycopg[async]>=3.2.0",
+    "redis[hiredis]>=5.2.0",
+    "clerk-backend-api>=2.0.0",
+    "polar-sdk>=0.14.0",
+    "resend>=2.8.0",
+    "apscheduler>=3.10.0",
+    "pydantic-settings>=2.7.0",
+    "pydantic>=2.10.0",
+    "httpx>=0.28.0",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib>=1.7.4",
+    "python-multipart>=0.0.20",
+    "svix>=1.45.0",
+    "aiofiles>=24.1.0",
+    "structlog>=24.4.0",
+    "tenacity>=9.0.0",
+    "psycopg-binary>=3.3.3",
+    "email-validator>=2.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "pytest-cov>=6.0.0",
+    "httpx>=0.28.0",
+    "fakeredis>=2.26.0",
+    "factory-boy>=3.3.0",
+    "ruff>=0.9.0",
+    "black>=24.0.0",
+    "mypy>=1.14.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true

@@ -1,0 +1,44 @@
+# Pakalon Backend — Docker build context exclusions
+
+# Git
+.git/
+.gitignore
+
+# Python virtualenvs / caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+htmlcov/
+coverage/
+.coverage
+*.egg-info/
+dist/
+build/
+
+# Secrets & environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Dev tooling
+.vscode/
+.idea/
+*.swp
+*.log
+
+# Test fixtures
+tests/
+
+# Docker meta-files (no need to copy into the image)
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Documentation
+README.md
+CHANGELOG.md
