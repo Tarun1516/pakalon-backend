@@ -45,10 +45,10 @@ class Settings(BaseSettings):
     # ── Redis ─────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
 
-    # ── Clerk ─────────────────────────────────────────────────
-    clerk_secret_key: str = ""
-    clerk_publishable_key: str = ""
-    clerk_webhook_secret: str = ""
+    # ── Supabase ──────────────────────────────────────────
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    supabase_jwt_secret: str = ""
 
     # ── Polar ─────────────────────────────────────────────────
     polar_access_token: str = ""

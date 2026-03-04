@@ -6,13 +6,17 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
-from app.dependencies import get_clerk_user
+from app.dependencies import get_supabase_user
 from app.schemas.auth import (
     DeviceCodeCreateRequest,
     DeviceCodeCreateResponse,
     DeviceCodeConfirmRequest,
     DeviceCodeConfirmResponse,
     DeviceCodePollResponse,
+    DeviceCodeWebConfirmRequest,
+    DeviceCodeWebConfirmResponse,
+    WebSignInRequest,
+    WebSignInResponse,
 )
 from app.services import device_code as device_code_svc
 
@@ -116,42 +120,35 @@ async def confirm_device_code(
     device_id: str,
     body: DeviceCodeConfirmRequest,
     session: AsyncSession = Depends(get_session),
-    clerk_payload: dict = Depends(get_clerk_user),
+    supabase_payload: dict = Depends(get_supabase_user),
 ):
     """
-    The Pakalon website calls this after the user logs in with Clerk and enters
-    (or auto-submits) the 6-digit code shown in the CLI.
+    The Pakalon website calls this after the user logs in with Supabase GitHub OAuth
+    and enters (or auto-submits) the 6-digit code shown in the CLI.
 
-    Requires a valid Clerk JWT in the Authorization header.
+    Requires a valid Supabase JWT in the Authorization header.
     """
-    clerk_user_id: str = clerk_payload["sub"]
+    supabase_user_id: str = supabase_payload["sub"]
 
-    # T-BACK-15: Extract GitHub identity from the verified external_accounts claim.
-    # _enforce_github_provider() in get_clerk_user already confirmed the provider is GitHub.
-    _ext = clerk_payload.get("external_accounts") or []
-    _github_account = next(
-        (
-            a for a in _ext
-            if "github" in str(a.get("provider", "")).lower()
-        ),
-        _ext[0] if _ext else {},
-    )
+    # Extract GitHub identity from Supabase user_metadata (populated by GitHub OAuth)
+    user_meta = supabase_payload.get("user_metadata", {})
     github_login: str | None = (
-        _github_account.get("username")
-        or _github_account.get("external_id")
-        or clerk_payload.get("username")
+        user_meta.get("user_name")
+        or user_meta.get("preferred_username")
+        or user_meta.get("login")
     )
-    email: str | None = (clerk_payload.get("email_addresses") or [{}])[0].get("email_address")
+    email: str | None = supabase_payload.get("email") or user_meta.get("email")
     display_name: str | None = (
-        clerk_payload.get("first_name") or ""
-    ) + " " + (clerk_payload.get("last_name") or "")
-    display_name = display_name.strip() or None
+        user_meta.get("full_name")
+        or user_meta.get("name")
+        or github_login
+    )
 
     try:
         dc, user = await device_code_svc.confirm_code(
             device_id=device_id,
             code=body.code,
-            clerk_user_id=clerk_user_id,
+            clerk_user_id=supabase_user_id,
             github_login=github_login,
             email=email,
             display_name=display_name,
@@ -171,4 +168,110 @@ async def confirm_device_code(
         token=token,
         user_id=user.id,
         plan=user.plan,
+    )
+
+
+@router.post(
+    "/devices/{device_id}/web-confirm",
+    response_model=DeviceCodeWebConfirmResponse,
+    summary="Confirm device code from web UI — no JWT required",
+)
+async def web_confirm_device_code(
+    device_id: str,
+    body: DeviceCodeWebConfirmRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Called by the web `/[device_id]/auth/` page after the user enters the
+    6-digit code.  No authentication required — a user record is
+    created or looked up by email / github_login.
+
+    The CLI polls `/devices/{device_id}/token` concurrently and will receive
+    the JWT as soon as this endpoint writes it to Redis.
+    """
+    try:
+        _dc, user, token = await device_code_svc.web_confirm_code(
+            device_id=device_id,
+            code=body.code,
+            email=body.email,
+            github_login=body.github_login,
+            display_name=body.display_name,
+            session=session,
+            redis=_get_redis(),
+        )
+        await session.commit()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        logger.exception("Error in web_confirm_device_code: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication failed due to a server error",
+        ) from exc
+
+    return DeviceCodeWebConfirmResponse(
+        status="approved",
+        user_id=user.id,
+        plan=user.plan,
+        token=token,
+        message=(
+            "Authentication successful! "
+            "You may close this window and start building applications using Pakalon."
+        ),
+    )
+
+
+@router.post(
+    "/web-signin",
+    response_model=WebSignInResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Exchange Supabase GitHub OAuth session for a Pakalon JWT",
+)
+async def web_signin(
+    body: WebSignInRequest,
+    supabase_payload: dict = Depends(get_supabase_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Called by the web dashboard login page after Supabase GitHub OAuth completes.
+
+    Accepts the Supabase access token (via Authorization: Bearer) plus the user's
+    GitHub login extracted from the Supabase session on the frontend.  Creates or
+    finds the user record and returns a Pakalon JWT for subsequent API calls.
+    """
+    from app.services.trial_abuse import get_or_create_user_by_github  # noqa: PLC0415
+
+    # Supabase user UUID — stored in the clerk_id column (external auth provider ID)
+    supabase_user_id: str = supabase_payload.get("sub", "")
+    if not supabase_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Supabase token missing subject claim",
+        )
+
+    try:
+        user = await get_or_create_user_by_github(
+            github_login=body.github_login,
+            clerk_id=supabase_user_id,
+            email=body.email,
+            display_name=body.display_name,
+            session=session,
+        )
+        await session.commit()
+    except Exception as exc:
+        logger.exception("Error in web_signin: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Sign-in failed due to a server error",
+        ) from exc
+
+    token = device_code_svc.issue_jwt(user)
+    return WebSignInResponse(
+        token=token,
+        user_id=user.id,
+        plan=user.plan,
+        github_login=user.github_login,
     )

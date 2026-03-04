@@ -227,3 +227,85 @@ def issue_jwt(user: User) -> str:
         "exp": now + timedelta(days=settings.jwt_expire_days),
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+async def web_confirm_code(
+    device_id: str,
+    code: str,
+    email: str | None,
+    github_login: str | None,
+    display_name: str | None,
+    session: AsyncSession,
+    redis=None,
+) -> tuple[DeviceCode, User, str]:
+    """
+    Confirm a device code submitted from the web UI (no Clerk JWT required).
+
+    Creates or finds a user based on email / github_login, marks the device
+    code as approved, and caches the JWT in Redis so the CLI poller gets it.
+
+    Returns (device_code, user) on success.
+    Raises ValueError for invalid/expired/unknown codes.
+    """
+    normalized_code = (code or "").strip()
+    if len(normalized_code) != 6 or not normalized_code.isdigit():
+        raise ValueError("Invalid code format. Code must be 6 digits")
+
+    result = await session.execute(
+        select(DeviceCode).where(
+            DeviceCode.device_id == device_id,
+            DeviceCode.status == "pending",
+        )
+    )
+    device_code = result.scalar_one_or_none()
+
+    if device_code is None:
+        raise ValueError("Device code not found or already used")
+
+    if datetime.now(tz=timezone.utc) > device_code.expires_at:
+        device_code.status = "expired"
+        await session.flush()
+        raise ValueError("Device code has expired")
+
+    if device_code.code != normalized_code:
+        raise ValueError("Invalid device code")
+
+    # Derive stable identifiers from whatever the web page provides.
+    # Fall back to a deterministic slug so user creation never fails.
+    _github_login = (
+        github_login
+        or (email.split("@")[0] if email else None)
+        or f"device_{device_code.device_id[:8]}"
+    )
+    # Use a synthetic clerk_id so the upsert path in get_or_create_user_by_github
+    # stays stable across re-auths from the same device.
+    _clerk_id = f"web_{device_code.device_id}"
+
+    from app.services.trial_abuse import get_or_create_user_by_github  # noqa: PLC0415
+
+    user = await get_or_create_user_by_github(
+        github_login=_github_login,
+        clerk_id=_clerk_id,
+        email=email,
+        display_name=display_name,
+        session=session,
+        machine_id=device_code.machine_id,
+        device_id=device_code.device_id,
+    )
+
+    # Mark device code as approved
+    device_code.status = "approved"
+    device_code.clerk_user_id = _clerk_id
+    device_code.user_id = user.id
+    device_code.approved_at = datetime.now(tz=timezone.utc)
+    await session.flush()
+
+    # Issue JWT for both the CLI poller and the web dashboard session
+    token = issue_jwt(user)
+
+    # Cache the JWT in Redis so the CLI poller picks it up immediately
+    if redis is not None:
+        redis_key = f"device_token:{device_id}"
+        await redis.setex(redis_key, DEVICE_CODE_TTL_SECONDS, token)
+
+    return device_code, user, token

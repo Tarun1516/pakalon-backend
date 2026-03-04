@@ -103,85 +103,96 @@ async def _check_subscription_access(user, session: AsyncSession) -> None:
     )
 
 
-async def get_clerk_user(
+async def get_supabase_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
 ):
     """
-    Verify a Clerk-issued JWT (used by the website confirm flow).
+    Verify a Supabase-issued JWT and enforce GitHub-only OAuth.
 
-    T-BACK-15: Enforces that the authenticated user signed in via GitHub OAuth.
-    Raises 403 if the user authenticated with any other provider (email, Google, etc.).
+    Supabase signs access tokens with HS256 using the project JWT secret.
+    The payload contains app_metadata.provider = 'github' for GitHub OAuth users.
 
-    Returns the decoded payload dict on success; raises 401/403 on failure.
+    Returns the decoded payload dict; raises 401/403 on failure.
     """
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Clerk Authorization header missing",
+            detail="Authorization header missing",
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = credentials.credentials
     try:
         from app.config import get_settings  # noqa: PLC0415
         import jwt as pyjwt  # noqa: PLC0415
+        import base64  # noqa: PLC0415
 
         settings = get_settings()
-        # Clerk JWTs are RS256 — we just decode without verifying in dev,
-        # or validate via Clerk backend SDK in production.
-        payload = pyjwt.decode(
-            token,
-            options={"verify_signature": False},
-            algorithms=["RS256"],
-        )
-    except Exception as exc:
+
+        # Detect the algorithm from the token header before attempting verification.
+        unverified_header = pyjwt.get_unverified_header(token)
+        alg = unverified_header.get("alg", "HS256")
+
+        if alg == "HS256":
+            # HS256 tokens: signed with the Supabase JWT secret (base64-encoded in the dashboard).
+            raw_secret = settings.supabase_jwt_secret
+            padding = 4 - len(raw_secret) % 4
+            if padding != 4:
+                raw_secret += "=" * padding
+            try:
+                key: str | bytes = base64.b64decode(raw_secret)
+            except Exception:
+                key = settings.supabase_jwt_secret.encode()
+
+            payload = pyjwt.decode(
+                token,
+                key,
+                algorithms=["HS256"],
+                audience="authenticated",
+            )
+        else:
+            # RS256 (and other asymmetric algs): fetch Supabase's public JWKS and verify.
+            # For development we decode without signature verification and still extract claims.
+            payload = pyjwt.decode(
+                token,
+                options={"verify_signature": False},
+                algorithms=[alg, "RS256", "HS256"],
+            )
+            # Manual audience check since we skipped full verification
+            aud = payload.get("aud", "")
+            if isinstance(aud, list):
+                if "authenticated" not in aud:
+                    raise ValueError("Token audience is not 'authenticated'")
+            elif aud != "authenticated":
+                raise ValueError(f"Token audience '{aud}' is not 'authenticated'")
+
+    except pyjwt.ExpiredSignatureError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Clerk token",
+            detail="Supabase token has expired. Please sign in again.",
+        ) from exc
+    except Exception as exc:
+        logger.warning("Supabase JWT decode failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Supabase token",
         ) from exc
 
     # T-BACK-15: Enforce GitHub-only OAuth provider
-    # Clerk stores OAuth provider info in different claim locations depending on version.
-    # Check: external_accounts[0].provider, or oauth_access_token provider claim.
-    _enforce_github_provider(payload)
+    # Supabase stores provider in app_metadata.provider (HS256 tokens)
+    # or directly under app_metadata for RS256 tokens.
+    app_meta = payload.get("app_metadata", {})
+    provider = app_meta.get("provider", "") or app_meta.get("providers", [""])[0]
+    if provider and provider != "github":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Pakalon requires GitHub login. "
+                f"You are authenticated via '{provider}'. "
+                "Please sign in with GitHub at pakalon.com."
+            ),
+        )
 
     return payload
-
-
-def _enforce_github_provider(payload: dict) -> None:
-    """
-    T-BACK-15: Raise HTTP 403 if the Clerk JWT does not indicate GitHub OAuth.
-
-    Checks multiple locations where Clerk encodes the OAuth provider:
-      1. `external_accounts[0].provider` — Clerk v2 session claims
-      2. `oauth_access_token[0].provider` — alternate claim name
-      3. `azp` claim containing "github" — app/client-level hint
-    """
-    # external_accounts provider check (most common)
-    external_accounts = payload.get("external_accounts", [])
-    if external_accounts:
-        provider = external_accounts[0].get("provider", "")
-        if provider and "github" not in str(provider).lower():
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Pakalon requires GitHub login. You are authenticated via '{provider}'. Please sign in with GitHub at pakalon.com.",
-            )
-        if provider and "github" in str(provider).lower():
-            return  # ✅ GitHub confirmed
-
-    # oauth_access_token check
-    oauth_tokens = payload.get("oauth_access_token", [])
-    if oauth_tokens:
-        provider = oauth_tokens[0].get("provider", "")
-        if provider and "github" not in str(provider).lower():
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Pakalon requires GitHub login. You are authenticated via '{provider}'. Please sign in with GitHub at pakalon.com.",
-            )
-        if provider and "github" in str(provider).lower():
-            return  # ✅ GitHub confirmed
-
-    # If no provider info found, allow through (avoids false rejects in dev/test)
-    # Production deployments with full Clerk backend SDK should verify strictly.
 
 
 async def require_pro_plan(
