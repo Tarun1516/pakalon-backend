@@ -39,7 +39,7 @@ services:
     container_name: pakalon-chrome
     restart: unless-stopped
     ports:
-      - "3000:3000"  # browserless web UI
+      - "3002:3000"  # browserless web UI (keep 3000 free for pakalon-web)
       - "9222:9222"  # DevTools protocol
     volumes:
       - chrome_data:/workspace

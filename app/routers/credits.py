@@ -162,9 +162,13 @@ async def startup_credit_check(
     """
     Called by the CLI on startup to determine if the user has credits left.
 
-    - If the user is on a paid plan and has credits_remaining > 0: can_interact=True.
-    - If credits_remaining == 0: can_interact=False with a blocking reason message.
-    - Free-plan users are checked against trial limits.
+        - If the user is on a paid credit-bearing plan and has credits_remaining > 0:
+            can_interact=True.
+        - If a credit-bearing plan reaches 0 remaining credits: can_interact=False
+            with a blocking reason message.
+        - Plans that do not participate in the credit system (for example `free`,
+            which is handled via free-model gating + trial enforcement elsewhere)
+            should still be allowed to enter the app.
     """
     ledger = await credit_svc.get_or_create_ledger(
         user_id=current_user.id,
@@ -172,6 +176,13 @@ async def startup_credit_check(
         session=session,
     )
     await session.commit()
+
+    if ledger.credits_total == 0:
+        return StartupCheckResponse(
+            can_interact=True,
+            credits_remaining=ledger.credits_remaining,
+            plan=ledger.plan,
+        )
 
     if ledger.credits_remaining <= 0:
         return StartupCheckResponse(

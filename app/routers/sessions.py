@@ -381,6 +381,9 @@ async def record_usage(
     ):
         # Fetch model display name from cache if possible
         from app.models.model_cache import ModelCache  # noqa: PLC0415
+        from app.services.model_registry import ensure_model_cache_schema_compat  # noqa: PLC0415
+
+        await ensure_model_cache_schema_compat(session)
         mc_result = await session.execute(
             select(ModelCache).where(ModelCache.model_id == body.model_id)
         )

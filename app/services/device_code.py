@@ -1,4 +1,5 @@
-"""Device code service — core 6-digit auth flow."""
+"""Device code service — core 6-character auth flow."""
+import json
 import logging
 import secrets
 import uuid
@@ -7,6 +8,7 @@ from typing import Any
 
 import jwt
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -16,11 +18,142 @@ from app.models.user import User
 logger = logging.getLogger(__name__)
 
 DEVICE_CODE_TTL_SECONDS = 600  # 10 minutes
+DEVICE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+async def _build_approved_poll_payload(
+    user: User,
+    token: str,
+    session: AsyncSession,
+) -> dict[str, Any]:
+    """Return the full CLI poll payload for an approved device code."""
+    from app.services.trial_abuse import remaining_trial_days  # noqa: PLC0415
+    from app.services.billing import get_subscription_status  # noqa: PLC0415
+
+    remaining = remaining_trial_days(user)
+    trial_ends_at: str | None = None
+    billing_days_remaining: int | None = None
+    if user.plan not in ("pro", "enterprise"):
+        trial_end_date = utcnow().date() + timedelta(days=remaining)
+        trial_ends_at = trial_end_date.isoformat()
+    else:
+        billing_state = await get_subscription_status(user.id, session)
+        billing_days_remaining = billing_state.get("days_remaining")
+
+    return {
+        "status": "approved",
+        "token": token,
+        "user_id": user.id,
+        "plan": user.plan,
+        "github_login": user.github_login,
+        "display_name": user.display_name,
+        "trial_days_remaining": remaining if user.plan not in ("pro", "enterprise") else None,
+        "billing_days_remaining": billing_days_remaining,
+        "trial_ends_at": trial_ends_at,
+    }
+
+
+async def _encode_approved_poll_payload(
+    user: User,
+    token: str,
+    session: AsyncSession,
+) -> str:
+    """Serialize the approved poll payload for Redis caching."""
+    return json.dumps(await _build_approved_poll_payload(user, token, session))
+
+
+def _decode_cached_poll_payload(value: Any) -> dict[str, Any] | None:
+    """Decode a cached Redis poll payload, supporting legacy token-only entries."""
+    if value is None:
+        return None
+
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"status": "approved", "token": value}
+        if isinstance(parsed, dict):
+            parsed.setdefault("status", "approved")
+            return parsed
+        return None
+
+    if isinstance(value, dict):
+        value.setdefault("status", "approved")
+        return value
+
+    return None
+
+
+def utcnow() -> datetime:
+    """Return a timezone-aware UTC timestamp."""
+    return ensure_utc(datetime.now(tz=timezone.utc))
+
+
+def ensure_utc(value: datetime) -> datetime:
+    """Normalize DB datetimes so SQLite tests and Postgres behave consistently."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def generate_code() -> str:
-    """Generate a cryptographically random 6-digit numeric code."""
-    return f"{secrets.randbelow(1_000_000):06d}"
+    """Generate a cryptographically random 6-character alphanumeric code."""
+    return "".join(secrets.choice(DEVICE_CODE_ALPHABET) for _ in range(6))
+
+
+def normalize_code(code: str | None) -> str:
+    """Normalize user-entered auth codes before validation."""
+    return (code or "").strip().upper()
+
+
+def is_valid_code_format(code: str) -> bool:
+    """Validate that *code* is a 6-character Pakalon auth code."""
+    return len(code) == 6 and all(ch in DEVICE_CODE_ALPHABET for ch in code)
+
+
+async def detect_launch_experience(
+    device_id: str,
+    machine_id: str | None,
+    session: AsyncSession,
+) -> tuple[bool, str]:
+    """
+    Decide whether the CLI should show the first-run video or returning-run text logo.
+
+    A machine is considered "returning" if we have previously seen its machine_id,
+    device_id, session activity, or login activity.
+    """
+    from app.models.login_event import LoginEvent  # noqa: PLC0415
+    from app.models.machine_id import MachineId  # noqa: PLC0415
+    from app.models.session import Session  # noqa: PLC0415
+
+    try:
+        if machine_id:
+            checks = [
+                select(MachineId.id).where(MachineId.machine_id == machine_id).limit(1),
+                select(LoginEvent.id).where(LoginEvent.machine_id == machine_id).limit(1),
+                select(Session.id).where(Session.machine_id == machine_id).limit(1),
+                select(DeviceCode.id).where(DeviceCode.machine_id == machine_id).limit(1),
+            ]
+            for query in checks:
+                existing = await session.execute(query)
+                if existing.scalar_one_or_none() is not None:
+                    return False, "text"
+
+        if device_id:
+            existing_device = await session.execute(
+                select(DeviceCode.id).where(DeviceCode.device_id == device_id).limit(1)
+            )
+            if existing_device.scalar_one_or_none() is not None:
+                return False, "text"
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.debug("Falling back to first-run launch experience detection", exc_info=True)
+        return True, "video"
+
+    return True, "video"
 
 
 async def create_device_code(
@@ -28,28 +161,29 @@ async def create_device_code(
     machine_id: str | None,
     session: AsyncSession,
     redis=None,
-) -> DeviceCode:
+) -> tuple[DeviceCode, bool, str]:
     """
     Create a new device code record in PostgreSQL and store in Redis with TTL.
 
-    Returns the newly created DeviceCode.
+    Returns the newly created DeviceCode plus launch metadata.
     """
-    # Check if an active code already exists for this device_id
+    is_first_machine_run, launch_experience = await detect_launch_experience(
+        device_id=device_id,
+        machine_id=machine_id,
+        session=session,
+    )
+
+    # Replace any existing code row for this device_id so re-auth works cleanly.
     existing = await session.execute(
-        select(DeviceCode).where(
-            DeviceCode.device_id == device_id,
-            DeviceCode.status == "pending",
-        )
+        select(DeviceCode).where(DeviceCode.device_id == device_id)
     )
     existing_code = existing.scalar_one_or_none()
     if existing_code:
-        # Delete the old pending code so the unique constraint on device_id
-        # is freed before we insert the replacement row.
         await session.delete(existing_code)
         await session.flush()
 
     code = generate_code()
-    expires_at = datetime.now(tz=timezone.utc) + timedelta(seconds=DEVICE_CODE_TTL_SECONDS)
+    expires_at = utcnow() + timedelta(seconds=DEVICE_CODE_TTL_SECONDS)
 
     device_code = DeviceCode(
         id=str(uuid.uuid4()),
@@ -63,22 +197,21 @@ async def create_device_code(
     await session.flush()
     await session.refresh(device_code)
 
-    # Cache in Redis for fast polling
+    # Cache in Redis for fast polling (best-effort; not required)
     if redis is not None:
-        redis_key = f"device_code:{device_id}"
-        await redis.setex(
-            redis_key,
-            DEVICE_CODE_TTL_SECONDS,
-            code,
-        )
+        try:
+            redis_key = f"device_code:{device_id}"
+            await redis.setex(redis_key, DEVICE_CODE_TTL_SECONDS, code)
+        except Exception:
+            logger.warning("Redis unavailable — device code created in DB only")
 
-    return device_code
+    return device_code, is_first_machine_run, launch_experience
 
 
 async def confirm_code(
     device_id: str,
     code: str,
-    clerk_user_id: str,
+    supabase_user_id: str,
     github_login: str | None,
     email: str | None,
     display_name: str | None,
@@ -86,15 +219,15 @@ async def confirm_code(
     redis=None,
 ) -> tuple[DeviceCode, User]:
     """
-    Confirm a device code from the website (user has authenticated via Clerk).
+    Confirm a device code from the website (user has authenticated via Supabase).
 
     Returns (device_code, user) on success.
     Raises ValueError for invalid/expired codes.
     """
-    # Enforce strict 6-digit code format server-side
-    normalized_code = (code or "").strip()
-    if len(normalized_code) != 6 or not normalized_code.isdigit():
-        raise ValueError("Invalid code format. Code must be 6 digits")
+    # Enforce strict 6-character Pakalon code format server-side
+    normalized_code = normalize_code(code)
+    if not is_valid_code_format(normalized_code):
+        raise ValueError("Invalid code format. Code must be 6 letters/numbers")
 
     # Look up the pending device code
     result = await session.execute(
@@ -108,7 +241,7 @@ async def confirm_code(
     if device_code is None:
         raise ValueError("Device code not found or already used")
 
-    if datetime.now(tz=timezone.utc) > device_code.expires_at:
+    if utcnow() > ensure_utc(device_code.expires_at):
         device_code.status = "expired"
         await session.flush()
         raise ValueError("Device code has expired")
@@ -121,7 +254,7 @@ async def confirm_code(
 
     user = await get_or_create_user_by_github(
         github_login=github_login or "",
-        clerk_id=clerk_user_id,
+        supabase_id=supabase_user_id,
         email=email,
         display_name=display_name,
         session=session,
@@ -141,16 +274,23 @@ async def confirm_code(
 
     # Mark code as approved
     device_code.status = "approved"
-    device_code.clerk_user_id = clerk_user_id
+    device_code.supabase_user_id = supabase_user_id
     device_code.user_id = user.id
-    device_code.approved_at = datetime.now(tz=timezone.utc)
+    device_code.approved_at = utcnow()
     await session.flush()
 
-    # Cache the JWT in Redis so the CLI poller gets it fast
+    # Cache the JWT in Redis so the CLI poller gets it fast (best-effort)
     if redis is not None:
         token = issue_jwt(user)
-        redis_key = f"device_token:{device_id}"
-        await redis.setex(redis_key, DEVICE_CODE_TTL_SECONDS, token)
+        try:
+            redis_key = f"device_token:{device_id}"
+            await redis.setex(
+                redis_key,
+                DEVICE_CODE_TTL_SECONDS,
+                await _encode_approved_poll_payload(user, token, session),
+            )
+        except Exception:
+            logger.warning("Redis unavailable — JWT not cached, CLI will poll DB")
 
     return device_code, user
 
@@ -168,9 +308,12 @@ async def poll_status(
     """
     # Check Redis cache first (fast path for approved state)
     if redis is not None:
-        cached_token = await redis.get(f"device_token:{device_id}")
-        if cached_token:
-            return {"status": "approved", "token": cached_token}
+        try:
+            cached_payload = _decode_cached_poll_payload(await redis.get(f"device_token:{device_id}"))
+            if cached_payload and cached_payload.get("token") and cached_payload.get("user_id"):
+                return cached_payload
+        except Exception:
+            logger.warning("Redis unavailable — falling through to DB poll")
 
     result = await session.execute(
         select(DeviceCode).where(DeviceCode.device_id == device_id)
@@ -183,7 +326,7 @@ async def poll_status(
     if device_code.status == "expired":
         return {"status": "expired"}
 
-    if datetime.now(tz=timezone.utc) > device_code.expires_at:
+    if utcnow() > ensure_utc(device_code.expires_at):
         device_code.status = "expired"
         await session.flush()
         return {"status": "expired"}
@@ -195,22 +338,7 @@ async def poll_status(
         )
         user = result2.scalar_one_or_none()
         if user:
-            from app.services.trial_abuse import remaining_trial_days  # noqa: PLC0415
-            remaining = remaining_trial_days(user)
-            # Compute trial_ends_at as today + remaining days (free accounts only)
-            trial_ends_at: str | None = None
-            if user.plan not in ("pro", "enterprise"):
-                from datetime import timedelta  # noqa: PLC0415
-                trial_end_date = datetime.now(tz=timezone.utc).date() + timedelta(days=remaining)
-                trial_ends_at = trial_end_date.isoformat()
-            return {
-                "status": "approved",
-                "token": issue_jwt(user),
-                "user_id": user.id,
-                "plan": user.plan,
-                "trial_days_remaining": remaining if user.plan not in ("pro", "enterprise") else None,
-                "trial_ends_at": trial_ends_at,
-            }
+            return await _build_approved_poll_payload(user, issue_jwt(user), session)
 
     return {"status": "pending"}
 
@@ -247,9 +375,9 @@ async def web_confirm_code(
     Returns (device_code, user) on success.
     Raises ValueError for invalid/expired/unknown codes.
     """
-    normalized_code = (code or "").strip()
-    if len(normalized_code) != 6 or not normalized_code.isdigit():
-        raise ValueError("Invalid code format. Code must be 6 digits")
+    normalized_code = normalize_code(code)
+    if not is_valid_code_format(normalized_code):
+        raise ValueError("Invalid code format. Code must be 6 letters/numbers")
 
     result = await session.execute(
         select(DeviceCode).where(
@@ -262,7 +390,7 @@ async def web_confirm_code(
     if device_code is None:
         raise ValueError("Device code not found or already used")
 
-    if datetime.now(tz=timezone.utc) > device_code.expires_at:
+    if utcnow() > ensure_utc(device_code.expires_at):
         device_code.status = "expired"
         await session.flush()
         raise ValueError("Device code has expired")
@@ -277,15 +405,15 @@ async def web_confirm_code(
         or (email.split("@")[0] if email else None)
         or f"device_{device_code.device_id[:8]}"
     )
-    # Use a synthetic clerk_id so the upsert path in get_or_create_user_by_github
+    # Use a synthetic supabase_id so the upsert path in get_or_create_user_by_github
     # stays stable across re-auths from the same device.
-    _clerk_id = f"web_{device_code.device_id}"
+    _supabase_id = f"web_{device_code.device_id}"
 
     from app.services.trial_abuse import get_or_create_user_by_github  # noqa: PLC0415
 
     user = await get_or_create_user_by_github(
         github_login=_github_login,
-        clerk_id=_clerk_id,
+        supabase_id=_supabase_id,
         email=email,
         display_name=display_name,
         session=session,
@@ -295,17 +423,24 @@ async def web_confirm_code(
 
     # Mark device code as approved
     device_code.status = "approved"
-    device_code.clerk_user_id = _clerk_id
+    device_code.supabase_user_id = _supabase_id
     device_code.user_id = user.id
-    device_code.approved_at = datetime.now(tz=timezone.utc)
+    device_code.approved_at = utcnow()
     await session.flush()
 
     # Issue JWT for both the CLI poller and the web dashboard session
     token = issue_jwt(user)
 
-    # Cache the JWT in Redis so the CLI poller picks it up immediately
+    # Cache the JWT in Redis so the CLI poller picks it up immediately (best-effort)
     if redis is not None:
-        redis_key = f"device_token:{device_id}"
-        await redis.setex(redis_key, DEVICE_CODE_TTL_SECONDS, token)
+        try:
+            redis_key = f"device_token:{device_id}"
+            await redis.setex(
+                redis_key,
+                DEVICE_CODE_TTL_SECONDS,
+                await _encode_approved_poll_payload(user, token, session),
+            )
+        except Exception:
+            logger.warning("Redis unavailable — JWT not cached for web_confirm_code")
 
     return device_code, user, token

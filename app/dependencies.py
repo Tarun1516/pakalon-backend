@@ -11,6 +11,13 @@ from app.database import get_session
 
 logger = logging.getLogger(__name__)
 
+
+def _ensure_utc(value: datetime) -> datetime:
+    """Normalize DB datetimes so SQLite tests and Postgres behave consistently."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
 # Bearer token extractor
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -58,7 +65,7 @@ async def _check_subscription_access(user, session: AsyncSession) -> None:
     if user.plan != "pro":
         return  # Free/trial users are handled by trial expiry logic
 
-    now = datetime.now(tz=timezone.utc)
+    now = _ensure_utc(datetime.now(tz=timezone.utc))
 
     sub_result = await session.execute(
         select(Subscription)
@@ -77,7 +84,7 @@ async def _check_subscription_access(user, session: AsyncSession) -> None:
 
     if sub.status == "active":
         # T-BACK-05: block if period_end is in the past
-        if sub.period_end is not None and sub.period_end < now:
+        if sub.period_end is not None and _ensure_utc(sub.period_end) < now:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
                 detail="Your subscription has expired. Please renew at pakalon.com/billing",
@@ -86,7 +93,7 @@ async def _check_subscription_access(user, session: AsyncSession) -> None:
 
     if sub.status in ("past_due", "expired"):
         # T-BACK-04: check if grace period has elapsed
-        if sub.grace_end is None or sub.grace_end < now:
+        if sub.grace_end is None or _ensure_utc(sub.grace_end) < now:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
                 detail=(

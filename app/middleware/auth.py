@@ -13,6 +13,13 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _ensure_utc(value: datetime) -> datetime:
+    """Normalize DB datetimes so SQLite tests and Postgres behave consistently."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def verify_pakalon_jwt(token: str) -> dict[str, Any]:
     """
     Verify a Pakalon-issued JWT (HS256, 90-day expiry).
@@ -79,11 +86,11 @@ async def get_user_from_token(payload: dict[str, Any], session: AsyncSession):
             detail="This account has been deleted",
         )
 
-    now = datetime.now(tz=timezone.utc)
+    now = _ensure_utc(datetime.now(tz=timezone.utc))
 
     # Check trial expiry for free users
     if user.plan == "free" and user.trial_end is not None:
-        if user.trial_end < now:
+        if _ensure_utc(user.trial_end) < now:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Free trial has expired. Visit pakalon.com/pricing to upgrade.",
@@ -105,7 +112,7 @@ async def get_user_from_token(payload: dict[str, Any], session: AsyncSession):
         if subscription is not None:
             # Subscription is revoked/canceled and past grace period
             if subscription.status in ("canceled", "revoked") and subscription.grace_end is not None:
-                if subscription.grace_end < now:
+                if _ensure_utc(subscription.grace_end) < now:
                     # Grace period expired — effective plan is 'free'
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,

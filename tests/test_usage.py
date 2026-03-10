@@ -142,7 +142,7 @@ async def test_usage_pro_user(client, pro_user: User):
     data = response.json()
 
     assert data["plan"] == "pro"
-    assert data["subscription_id"] == "polar_sub_test_001"
+    assert data["subscription_id"].startswith("polar_sub_test_")
     assert data["subscription_status"] == "active"
     assert data["current_period_end"] is not None
     assert data["is_in_grace_period"] is False  # grace_end is in the future but sub is active

@@ -1,15 +1,27 @@
 """Heatmap service — contribution heatmap data aggregation."""
 import logging
-from datetime import date, datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.contribution_heatmap import ContributionHeatmap
-from app.models.model_usage import ModelUsage
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class HeatmapWindowDay:
+    date: date
+    count: int
+    level: int
+
+
+@dataclass(slots=True)
+class HeatmapWindow:
+    days: list[HeatmapWindowDay]
 
 
 def _calculate_level(total: int) -> int:
@@ -25,7 +37,7 @@ def _calculate_level(total: int) -> int:
     return 4
 
 
-async def get_contribution_heatmap(
+async def get_yearly_contribution_heatmap(
     user_id: str,
     year: int,
     db: AsyncSession,
@@ -109,6 +121,55 @@ async def get_contribution_heatmap(
     }
 
 
+async def get_contribution_heatmap(
+    user_id: str,
+    db: AsyncSession,
+    *,
+    days: int = 365,
+    end_date: date | None = None,
+) -> HeatmapWindow:
+    """Return a rolling-window heatmap used by the dashboard endpoint."""
+    safe_days = max(1, days)
+    final_day = end_date or datetime.now(tz=timezone.utc).date()
+    start_day = final_day - timedelta(days=safe_days - 1)
+
+    result = await db.execute(
+        select(ContributionHeatmap).where(
+            ContributionHeatmap.user_id == user_id,
+            ContributionHeatmap.contribution_date >= start_day,
+            ContributionHeatmap.contribution_date <= final_day,
+        )
+    )
+    contributions = result.scalars().all()
+
+    contrib_by_date: dict[date, ContributionHeatmap] = {
+        contribution.contribution_date: contribution
+        for contribution in contributions
+    }
+
+    current = start_day
+    window_days: list[HeatmapWindowDay] = []
+    while current <= final_day:
+        contribution = contrib_by_date.get(current)
+        count = 0
+        if contribution is not None:
+            count = (
+                contribution.lines_added
+                + contribution.commits
+                + contribution.sessions_count
+            )
+        window_days.append(
+            HeatmapWindowDay(
+                date=current,
+                count=count,
+                level=_calculate_level(count),
+            )
+        )
+        current += timedelta(days=1)
+
+    return HeatmapWindow(days=window_days)
+
+
 async def update_contribution_day(
     user_id: str,
     db: AsyncSession,
@@ -139,7 +200,6 @@ async def update_contribution_day(
         existing.commits += commits
         existing.tokens_used += tokens_used
         existing.sessions_count += sessions_count
-        existing.updated_at = datetime.now(tz=timezone.utc)
     else:
         new_contrib = ContributionHeatmap(
             user_id=user_id,

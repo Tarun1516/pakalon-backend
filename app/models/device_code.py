@@ -22,7 +22,7 @@ class DeviceCode(Base):
     # 6-digit numeric code displayed to the user
     code: Mapped[str] = mapped_column(String(6), nullable=False)
     # Clerk user id — set after the user confirms on the website
-    clerk_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    supabase_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Pakalon DB user id — set after confirmation
     user_id: Mapped[str | None] = mapped_column(
         UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

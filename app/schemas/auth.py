@@ -1,5 +1,7 @@
 """Pydantic schemas for auth endpoints."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -15,9 +17,12 @@ class DeviceCodeCreateRequest(BaseModel):
 
 class DeviceCodeCreateResponse(BaseModel):
     """Response after creating a device code."""
-    code: str = Field(..., description="6-digit numeric code to display to the user")
+    code: str = Field(..., description="6-character alphanumeric code to display to the user")
     device_id: str
     expires_in: int = Field(..., description="TTL in seconds")
+    verification_url: str = Field(..., description="Canonical browser URL for device verification")
+    is_first_machine_run: bool = Field(..., description="Whether this machine appears new to Pakalon")
+    launch_experience: Literal["video", "text"] = Field(..., description="Startup experience selected by the backend")
 
 
 class DeviceCodePollResponse(BaseModel):
@@ -26,9 +31,15 @@ class DeviceCodePollResponse(BaseModel):
     token: str | None = Field(None, description="JWT — only present when status=approved")
     user_id: str | None = None
     plan: str | None = None
+    github_login: str | None = None
+    display_name: str | None = None
     trial_days_remaining: int | None = Field(
         None,
         description="Days left in free trial; None for pro/enterprise; 0 = expired",
+    )
+    billing_days_remaining: int | None = Field(
+        None,
+        description="Days remaining in the current paid billing cycle; None for free users",
     )
     trial_ends_at: str | None = Field(
         None,
@@ -40,8 +51,8 @@ class DeviceCodeConfirmRequest(BaseModel):
     """Request to confirm a device code (from website with Supabase session)."""
     code: str = Field(
         ...,
-        pattern=r"^\d{6}$",
-        description="6-digit numeric code shown in CLI",
+        pattern=r"^[A-HJ-NP-Za-hj-np-z2-9]{6}$",
+        description="6-character alphanumeric code shown in CLI",
     )
 
 
@@ -57,8 +68,8 @@ class DeviceCodeWebConfirmRequest(BaseModel):
     """Request to confirm a device code from the web UI (no Clerk JWT required)."""
     code: str = Field(
         ...,
-        pattern=r"^\d{6}$",
-        description="6-digit numeric code shown in CLI",
+        pattern=r"^[A-HJ-NP-Za-hj-np-z2-9]{6}$",
+        description="6-character alphanumeric code shown in CLI",
     )
     email: str | None = Field(None, description="User email address")
     github_login: str | None = Field(None, description="GitHub username")

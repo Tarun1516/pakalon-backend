@@ -15,7 +15,7 @@ This avoids waterfall requests from the web UI and reduces DX friction.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -24,7 +24,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
 from app.dependencies import get_current_user
-from app.models.contribution_heatmap import ContributionHeatmap
 from app.models.model_usage import ModelUsage
 from app.models.session import Session
 from app.models.subscription import Subscription
@@ -47,6 +46,8 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 )
 async def get_dashboard_stats(
     days: int = Query(default=365, ge=7, le=730, description="Heatmap / history window in days"),
+    start_date: date | None = Query(default=None, description="Exact inclusive start date override (YYYY-MM-DD)"),
+    end_date: date | None = Query(default=None, description="Exact inclusive end date override (YYYY-MM-DD)"),
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
@@ -66,7 +67,17 @@ async def get_dashboard_stats(
     ```
     """
     now = datetime.now(tz=timezone.utc)
-    since = now - timedelta(days=days)
+    if start_date or end_date:
+        start = start_date or ((now - timedelta(days=days - 1)).date())
+        end = end_date or now.date()
+        if end < start:
+            start, end = end, start
+        since = datetime.combine(start, time.min, tzinfo=timezone.utc)
+        until = datetime.combine(end, time.max, tzinfo=timezone.utc)
+        days = max(1, (end - start).days + 1)
+    else:
+        since = now - timedelta(days=days)
+        until = now
     user_id = current_user.id
 
     # ── Heatmap ──────────────────────────────────────────────────────────────
@@ -79,13 +90,18 @@ async def get_dashboard_stats(
         ]
     except Exception as exc:
         logger.warning("Dashboard: heatmap fetch failed: %s", exc)
+        await session.rollback()
         # Fall back to raw model_usage counts per day
         rows = await session.execute(
             select(
                 func.date_trunc("day", ModelUsage.created_at).label("day"),
                 func.count().label("count"),
             )
-            .where(ModelUsage.user_id == user_id, ModelUsage.created_at >= since)
+            .where(
+                ModelUsage.user_id == user_id,
+                ModelUsage.created_at >= since,
+                ModelUsage.created_at <= until,
+            )
             .group_by("day")
             .order_by("day")
         )
@@ -99,7 +115,11 @@ async def get_dashboard_stats(
     # ── Recent sessions ───────────────────────────────────────────────────────
     sessions_rows = await session.execute(
         select(Session)
-        .where(Session.user_id == user_id, Session.created_at >= since)
+        .where(
+            Session.user_id == user_id,
+            Session.created_at >= since,
+            Session.created_at <= until,
+        )
         .order_by(Session.created_at.desc())
         .limit(50)
     )
@@ -127,7 +147,11 @@ async def get_dashboard_stats(
             func.sum(ModelUsage.lines_written).label("total_lines"),
             func.count().label("call_count"),
         )
-        .where(ModelUsage.user_id == user_id, ModelUsage.created_at >= since)
+        .where(
+            ModelUsage.user_id == user_id,
+            ModelUsage.created_at >= since,
+            ModelUsage.created_at <= until,
+        )
         .group_by(ModelUsage.model_id)
         .order_by(func.sum(ModelUsage.tokens_used).desc())
     )
@@ -146,7 +170,11 @@ async def get_dashboard_stats(
         select(
             func.coalesce(func.sum(ModelUsage.tokens_used), 0).label("tokens"),
             func.coalesce(func.sum(ModelUsage.lines_written), 0).label("lines"),
-        ).where(ModelUsage.user_id == user_id, ModelUsage.created_at >= since)
+        ).where(
+            ModelUsage.user_id == user_id,
+            ModelUsage.created_at >= since,
+            ModelUsage.created_at <= until,
+        )
     )
     totals = totals_row.first()
     total_tokens = int(totals.tokens) if totals else 0
@@ -154,7 +182,9 @@ async def get_dashboard_stats(
 
     session_count_row = await session.execute(
         select(func.count()).select_from(Session).where(
-            Session.user_id == user_id, Session.created_at >= since
+            Session.user_id == user_id,
+            Session.created_at >= since,
+            Session.created_at <= until,
         )
     )
     total_sessions = session_count_row.scalar() or 0
@@ -210,6 +240,36 @@ async def get_dashboard_stats(
     except Exception:
         pass
 
+    # ── Recent login events ───────────────────────────────────────────────────
+    login_events_data: list[dict] = []
+    try:
+        from app.models.login_event import LoginEvent  # noqa: PLC0415
+        login_events_rows = await session.execute(
+            select(LoginEvent)
+            .where(
+                LoginEvent.user_id == user_id,
+                LoginEvent.created_at >= since,
+                LoginEvent.created_at <= until,
+            )
+            .order_by(LoginEvent.created_at.desc())
+            .limit(25)
+        )
+        login_events_data = [
+            {
+                "id": le.id,
+                "login_type": le.login_type,
+                "ip_address": str(le.ip_address) if le.ip_address else None,
+                "browser": le.browser,
+                "os": le.os,
+                "device_name": le.device_name,
+                "machine_id": le.machine_id,
+                "created_at": le.created_at.isoformat() if le.created_at else None,
+            }
+            for le in login_events_rows.scalars()
+        ]
+    except Exception as exc:
+        logger.warning("Dashboard: login events fetch failed: %s", exc)
+
     return {
         "user": {
             "id": current_user.id,
@@ -231,6 +291,7 @@ async def get_dashboard_stats(
             "sessions_today": sessions_today,
         },
         "credits": credits_data,
+        "login_events": login_events_data,
         "window_days": days,
         "generated_at": now.isoformat(),
     }

@@ -2,7 +2,7 @@
 import uuid
 from datetime import date, datetime, timezone
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Date, DateTime, ForeignKey, Integer
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,12 +39,6 @@ class ContributionHeatmap(Base):
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(tz=timezone.utc),
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        default=lambda: datetime.now(tz=timezone.utc),
-        onupdate=lambda: datetime.now(tz=timezone.utc),
     )
 
     def __repr__(self) -> str:

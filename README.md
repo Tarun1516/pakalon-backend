@@ -51,7 +51,7 @@ cp .env.example .env
 
 ```bash
 docker compose up -d
-# Starts PostgreSQL 16 on :5432 and Redis 7 on :6379
+# Starts PostgreSQL on :5433 and Redis 7 on :6379
 ```
 
 ### 4. Run migrations

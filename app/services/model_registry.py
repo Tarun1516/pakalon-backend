@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -38,6 +38,89 @@ PLAN_MODEL_TIERS = {
 }
 
 
+async def ensure_model_cache_schema_compat(session: AsyncSession) -> set[str]:
+    """Upgrade older model_cache table layouts in-place before ORM queries run."""
+
+    def _load_columns(sync_session) -> set[str]:
+        inspector = inspect(sync_session.connection())
+        if "model_cache" not in inspector.get_table_names():
+            return set()
+        return {column["name"] for column in inspector.get_columns("model_cache")}
+
+    columns = await session.run_sync(_load_columns)
+    if not columns:
+        return columns
+
+    dialect = session.get_bind().dialect.name
+    timestamp_type = "TIMESTAMP WITH TIME ZONE" if dialect == "postgresql" else "TIMESTAMP"
+    true_literal = "TRUE" if dialect == "postgresql" else "1"
+    statements: list[str] = []
+
+    if "context_length" not in columns:
+        statements.append("ALTER TABLE model_cache ADD COLUMN context_length INTEGER NOT NULL DEFAULT 0")
+        columns.add("context_length")
+    if "tier" not in columns:
+        statements.append("ALTER TABLE model_cache ADD COLUMN tier VARCHAR(20) NOT NULL DEFAULT 'paid'")
+        columns.add("tier")
+    if "fetched_at" not in columns:
+        statements.append(
+            f"ALTER TABLE model_cache ADD COLUMN fetched_at {timestamp_type} NULL"
+        )
+        columns.add("fetched_at")
+    if "model_created_at" not in columns:
+        statements.append(
+            f"ALTER TABLE model_cache ADD COLUMN model_created_at {timestamp_type} NULL"
+        )
+        columns.add("model_created_at")
+    if "cache_valid" not in columns:
+        statements.append(
+            f"ALTER TABLE model_cache ADD COLUMN cache_valid BOOLEAN NOT NULL DEFAULT {true_literal}"
+        )
+        columns.add("cache_valid")
+
+    changed = False
+    for statement in statements:
+        await session.execute(text(statement))
+        changed = True
+
+    assignments: list[str] = []
+    if "context_length" in columns and "context_window" in columns:
+        assignments.append(
+            "context_length = CASE "
+            "WHEN context_length IS NULL OR context_length = 0 THEN COALESCE(context_window, 0) "
+            "ELSE context_length END"
+        )
+    if "tier" in columns:
+        if "pricing_tier" in columns:
+            assignments.append(
+                "tier = CASE "
+                "WHEN (tier IS NULL OR tier = '') AND pricing_tier IS NOT NULL AND LOWER(pricing_tier) = 'free' THEN 'free' "
+                "WHEN (tier IS NULL OR tier = '') AND pricing_tier IS NOT NULL THEN 'paid' "
+                "WHEN tier = 'paid' AND pricing_tier IS NOT NULL AND LOWER(pricing_tier) = 'free' THEN 'free' "
+                "WHEN tier IS NULL OR tier = '' THEN 'paid' "
+                "ELSE tier END"
+            )
+        else:
+            assignments.append(
+                "tier = CASE WHEN tier IS NULL OR tier = '' THEN 'paid' ELSE tier END"
+            )
+    if "fetched_at" in columns and "updated_at" in columns:
+        assignments.append("fetched_at = COALESCE(fetched_at, updated_at, CURRENT_TIMESTAMP)")
+    elif "fetched_at" in columns:
+        assignments.append("fetched_at = COALESCE(fetched_at, CURRENT_TIMESTAMP)")
+    if "cache_valid" in columns:
+        assignments.append(f"cache_valid = COALESCE(cache_valid, {true_literal})")
+
+    if assignments:
+        await session.execute(text(f"UPDATE model_cache SET {', '.join(assignments)}"))
+        changed = True
+
+    if changed:
+        await session.commit()
+
+    return columns
+
+
 async def fetch_models_from_openrouter() -> list[dict[str, Any]]:
     """Fetch the current model list from OpenRouter API."""
     settings = get_settings()
@@ -62,6 +145,7 @@ def _classify_model(model: dict[str, Any]) -> str:
 
 async def cache_models(models: list[dict[str, Any]], session: AsyncSession) -> None:
     """Upsert model records in the database."""
+    await ensure_model_cache_schema_compat(session)
     now = datetime.now(tz=timezone.utc)
     for model_data in models:
         model_id = model_data.get("id", "")
@@ -105,9 +189,12 @@ async def cache_models(models: list[dict[str, Any]], session: AsyncSession) -> N
 async def get_models_for_plan(
     plan: str,
     session: AsyncSession,
+    *,
+    include_all: bool = False,
 ) -> list[dict[str, Any]]:
     """Return cached models appropriate for the given plan."""
-    tiers = PLAN_MODEL_TIERS.get(plan, ["free"])
+    await ensure_model_cache_schema_compat(session)
+    tiers = ["free", "paid"] if include_all else PLAN_MODEL_TIERS.get(plan, ["free"])
 
     # T041: Sort newest models first.
     # Primary key: model_created_at (OpenRouter release date) DESC — newest model first.
@@ -147,14 +234,18 @@ async def get_models_for_plan(
 
 async def is_cache_stale(session: AsyncSession) -> bool:
     """Return True if the model cache is older than CACHE_TTL_HOURS."""
+    await ensure_model_cache_schema_compat(session)
     result = await session.execute(
         select(ModelCache).order_by(ModelCache.fetched_at.desc()).limit(1)
     )
     latest = result.scalar_one_or_none()
     if latest is None:
         return True
+    fetched_at = latest.fetched_at
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
     threshold = datetime.now(tz=timezone.utc) - timedelta(hours=CACHE_TTL_HOURS)
-    return latest.fetched_at < threshold
+    return fetched_at < threshold
 
 
 async def get_model_context_window(model_id: str, session: AsyncSession) -> int:
@@ -162,6 +253,7 @@ async def get_model_context_window(model_id: str, session: AsyncSession) -> int:
     Return the context window size for a model_id.
     Falls back to 4096 if the model is not in cache.
     """
+    await ensure_model_cache_schema_compat(session)
     result = await session.execute(
         select(ModelCache).where(ModelCache.model_id == model_id)
     )

@@ -6,17 +6,21 @@ Usage:
     settings = get_settings()
 """
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
     """Centralised application settings loaded from environment variables."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=BACKEND_ROOT / ".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -41,14 +45,20 @@ class Settings(BaseSettings):
 
     # ── PostgreSQL ────────────────────────────────────────────
     database_url: str = "postgresql+psycopg://pakalon:pakalon@localhost:5432/pakalon"
+    development_allow_sqlite_fallback: bool = True
+    development_database_fallback_url: str = (
+        f"sqlite+aiosqlite:///{(BACKEND_ROOT / '.local' / 'pakalon-dev.db').as_posix()}"
+    )
 
     # ── Redis ─────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
+    development_allow_fakeredis_fallback: bool = True
 
     # ── Supabase ──────────────────────────────────────────
     supabase_url: str = ""
     supabase_anon_key: str = ""
     supabase_jwt_secret: str = ""
+    supabase_webhook_secret: str = ""  # Shared secret for Supabase auth webhooks
 
     # ── Polar ─────────────────────────────────────────────────
     polar_access_token: str = ""
@@ -63,6 +73,21 @@ class Settings(BaseSettings):
 
     # ── Frontend ──────────────────────────────────────────────
     frontend_url: str = "https://pakalon.com"
+    backend_public_url: str = "http://localhost:8000"
+
+    # ── OAuth Connectors (Automations) ───────────────────────
+    github_oauth_client_id: str = ""
+    github_oauth_client_secret: str = ""
+    slack_oauth_client_id: str = ""
+    slack_oauth_client_secret: str = ""
+    logo_dev_publishable_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("LOGO_DEV_PUBLISHABLE_KEY", "PUBLISHABLE_KEY"),
+    )
+    logo_dev_secret_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("LOGO_DEV_SECRET_KEY", "SECRET_KEY"),
+    )
 
     # ── OpenRouter ────────────────────────────────────────────
     openrouter_master_key: str = ""

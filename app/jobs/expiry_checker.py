@@ -25,14 +25,12 @@ async def run_expiry_checker(session: AsyncSession | None = None) -> None:
     3. Downgrade pro users whose grace period has elapsed
     4. Send 7-day warning emails for expiring subscriptions (T-BACK-03)
     """
-    from app.config import get_settings  # noqa: PLC0415
-    from app.database import create_async_engine  # noqa: PLC0415
+    from app.database import make_async_engine  # noqa: PLC0415
     from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: PLC0415
 
     own_session = session is None
     if own_session:
-        settings = get_settings()
-        engine = create_async_engine(settings.database_url, echo=False)
+        engine = make_async_engine(echo=False)
         _session_factory = async_sessionmaker(engine, expire_on_commit=False)
         session = _session_factory()
 

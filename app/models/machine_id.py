@@ -2,11 +2,15 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+
+
+SQLITE_SAFE_INET = INET().with_variant(String(45), "sqlite")
+SQLITE_SAFE_JSONB = JSONB().with_variant(JSON(), "sqlite")
 
 
 class MachineId(Base):
@@ -26,8 +30,8 @@ class MachineId(Base):
     machine_id: Mapped[str] = mapped_column(String(512), nullable=False)
     mac_machine_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     dev_device_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    ip_address: Mapped[str | None] = mapped_column(INET, nullable=True)
-    os_info: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(SQLITE_SAFE_INET, nullable=True)
+    os_info: Mapped[dict | None] = mapped_column(SQLITE_SAFE_JSONB, nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

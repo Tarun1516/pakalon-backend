@@ -1,4 +1,5 @@
 """Pytest configuration and shared fixtures for Pakalon backend tests."""
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator
@@ -21,6 +22,16 @@ from app.models.subscription import Subscription
 # ──────────────────────────────────────────────────────────────────────────────
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+
+
+@pytest.fixture(scope="session")
+def event_loop():
+    """Provide a session-scoped event loop for pytest-asyncio on Python 3.14+."""
+    loop = asyncio.new_event_loop()
+    try:
+        yield loop
+    finally:
+        loop.close()
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -74,11 +85,12 @@ async def fake_redis() -> AsyncGenerator[FakeRedis, None]:
 @pytest_asyncio.fixture
 async def free_user(db_session: AsyncSession) -> User:
     """A free-plan user with an active trial (10 days used)."""
+    suffix = uuid.uuid4().hex[:8]
     user = User(
         id=str(uuid.uuid4()),
-        clerk_id="clerk_free_user_test",
-        github_login="free-test-user",
-        email="free@test.example",
+        supabase_id=f"supabase_free_user_test_{suffix}",
+        github_login=f"free-test-user-{suffix}",
+        email=f"free-{suffix}@test.example",
         display_name="Free Test User",
         plan="free",
         trial_start=datetime.now(tz=timezone.utc) - timedelta(days=10),
@@ -94,11 +106,12 @@ async def free_user(db_session: AsyncSession) -> User:
 @pytest_asyncio.fixture
 async def pro_user(db_session: AsyncSession) -> User:
     """A pro-plan user with an active Polar subscription."""
+    suffix = uuid.uuid4().hex[:8]
     user = User(
         id=str(uuid.uuid4()),
-        clerk_id="clerk_pro_user_test",
-        github_login="pro-test-user",
-        email="pro@test.example",
+        supabase_id=f"supabase_pro_user_test_{suffix}",
+        github_login=f"pro-test-user-{suffix}",
+        email=f"pro-{suffix}@test.example",
         display_name="Pro Test User",
         plan="pro",
     )
@@ -109,7 +122,7 @@ async def pro_user(db_session: AsyncSession) -> User:
     subscription = Subscription(
         id=str(uuid.uuid4()),
         user_id=user.id,
-        polar_sub_id="polar_sub_test_001",
+        polar_sub_id=f"polar_sub_test_{suffix}",
         status="active",
         period_start=datetime.now(tz=timezone.utc) - timedelta(days=5),
         period_end=datetime.now(tz=timezone.utc) + timedelta(days=25),
@@ -124,11 +137,12 @@ async def pro_user(db_session: AsyncSession) -> User:
 @pytest_asyncio.fixture
 async def expired_user(db_session: AsyncSession) -> User:
     """A free-plan user whose trial has expired."""
+    suffix = uuid.uuid4().hex[:8]
     user = User(
         id=str(uuid.uuid4()),
-        clerk_id="clerk_expired_user_test",
-        github_login="expired-test-user",
-        email="expired@test.example",
+        supabase_id=f"supabase_expired_user_test_{suffix}",
+        github_login=f"expired-test-user-{suffix}",
+        email=f"expired-{suffix}@test.example",
         display_name="Expired Test User",
         plan="free",
         trial_start=datetime.now(tz=timezone.utc) - timedelta(days=35),

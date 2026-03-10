@@ -18,7 +18,7 @@ MIN_ACCOUNT_AGE_FOR_DELETE_DAYS = 1
 
 async def get_or_create_user_by_github(
     github_login: str,
-    clerk_id: str,
+    supabase_id: str,
     email: str | None,
     display_name: str | None,
     session: AsyncSession,
@@ -26,18 +26,18 @@ async def get_or_create_user_by_github(
     device_id: str | None = None,
 ) -> User:
     """
-    Upsert user by Clerk ID.
+    Upsert user by Supabase ID.
 
-    If the user already exists (same clerk_id), update github_login and
+    If the user already exists (same supabase_id), update github_login and
     record the machine fingerprint, then return.
     If new, create with trial reset — but carry over trial_days_used from:
       1. A prior user with the same github_login (account-level abuse).
       2. A prior user on the same machine (machine-level abuse).
     The higher of the two carry-over values is used.
     """
-    # Look up by clerk_id first
+    # Look up by supabase_id first
     result = await session.execute(
-        select(User).where(User.clerk_id == clerk_id)
+        select(User).where(User.supabase_id == supabase_id)
     )
     user = result.scalar_one_or_none()
 
@@ -94,7 +94,7 @@ async def get_or_create_user_by_github(
 
     user = User(
         id=str(uuid.uuid4()),
-        clerk_id=clerk_id,
+        supabase_id=supabase_id,
         github_login=github_login or "",
         email=email or "",
         display_name=display_name or github_login or "",

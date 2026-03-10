@@ -12,12 +12,10 @@ async def run_email_queue() -> None:
 
     Drains the pending email queue by sending emails via Resend.
     """
-    from app.config import get_settings  # noqa: PLC0415
-    from app.database import create_async_engine  # noqa: PLC0415
+    from app.database import make_async_engine  # noqa: PLC0415
     from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: PLC0415
 
-    settings = get_settings()
-    engine = create_async_engine(settings.database_url, echo=False)
+    engine = make_async_engine(echo=False)
     async_session = async_sessionmaker(engine, expire_on_commit=False)
 
     try:

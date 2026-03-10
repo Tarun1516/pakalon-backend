@@ -1,5 +1,7 @@
 """Pakalon Backend — FastAPI application factory."""
+import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -8,11 +10,38 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
+from app.database import DATABASE_UNAVAILABLE_DETAIL, initialize_database_if_needed, is_database_unavailable_error
 
 logger = logging.getLogger(__name__)
 
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # Global Redis client — initialized in lifespan
 redis_client = None
+
+
+async def _create_redis_client(settings):
+    import redis.asyncio as aioredis  # noqa: PLC0415
+
+    client = aioredis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        await client.ping()
+        logger.info("Redis connected")
+        return client
+    except Exception:
+        await client.aclose()
+        if settings.is_development and settings.development_allow_fakeredis_fallback:
+            from fakeredis.aioredis import FakeRedis  # noqa: PLC0415
+
+            logger.warning(
+                "Redis at %s is unavailable; using in-memory fakeredis fallback for development",
+                settings.redis_url,
+            )
+            return FakeRedis(decode_responses=True)
+
+        logger.warning("Redis at %s is unavailable; continuing without Redis", settings.redis_url)
+        return None
 
 
 @asynccontextmanager
@@ -22,14 +51,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
     logger.info("Starting Pakalon Backend (%s)", settings.environment)
 
-    # Initialize Redis
-    import redis.asyncio as aioredis  # noqa: PLC0415
-    redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
+    await initialize_database_if_needed()
+    redis_client = await _create_redis_client(settings)
 
     # Start APScheduler background jobs
     from app.scheduler import scheduler  # noqa: PLC0415
     scheduler.start()
     logger.info("APScheduler started")
+
+    from app.services.automations import restore_automation_jobs  # noqa: PLC0415
+
+    try:
+        await restore_automation_jobs()
+        logger.info("Automation jobs restored")
+    except Exception:
+        logger.exception(
+            "Automation job restoration failed during startup; continuing without scheduled automation rehydration"
+        )
 
     yield  # ← server is running here
 
@@ -57,6 +95,7 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
+        allow_origin_regex=(r"https?://(localhost|127\.0\.0\.1)(:\d+)?$" if settings.is_development else None),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -67,7 +106,7 @@ def create_app() -> FastAPI:
     app.add_middleware(GeoBlockMiddleware)
 
     # ── Routers ───────────────────────────────────────────────
-    from app.routers import auth, users, models, sessions, usage, telemetry, billing, webhooks, health, support, tools, admin, ai_proxy, media, figma, audit, notifications, credits, dashboard  # noqa: E501
+    from app.routers import auth, users, models, sessions, usage, telemetry, billing, webhooks, health, support, tools, admin, ai_proxy, media, figma, audit, notifications, credits, dashboard, automations  # noqa: E501
 
     app.include_router(health.router)
     app.include_router(auth.router)
@@ -88,10 +127,23 @@ def create_app() -> FastAPI:
     app.include_router(notifications.router)
     app.include_router(credits.router)
     app.include_router(dashboard.router)
+    app.include_router(automations.router)
 
     # ── Global exception handler ──────────────────────────────
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        if is_database_unavailable_error(exc):
+            logger.warning(
+                "Database unavailable while handling %s %s: %s",
+                request.method,
+                request.url,
+                exc,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={"detail": DATABASE_UNAVAILABLE_DETAIL},
+            )
+
         logger.exception("Unhandled exception on %s %s", request.method, request.url)
         return JSONResponse(
             status_code=500,

@@ -3,8 +3,8 @@ import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import create_async_engine
-from app.services.model_registry import cache_models, fetch_models_from_openrouter
+from app.database import make_async_engine
+from app.services.model_registry import cache_models, ensure_model_cache_schema_compat, fetch_models_from_openrouter
 from app.models.model_cache import ModelCache
 from sqlalchemy import select
 
@@ -18,17 +18,16 @@ async def run_model_refresh() -> None:
     Fetches the current model list from OpenRouter API and refreshes the
     local model_cache table.
     """
-    from app.config import get_settings  # noqa: PLC0415
     from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: PLC0415
 
-    settings = get_settings()
-    engine = create_async_engine(settings.database_url, echo=False)
+    engine = make_async_engine(echo=False)
     async_session = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
         models = await fetch_models_from_openrouter()
         logger.info("Fetched %d models from OpenRouter", len(models))
         async with async_session() as session:
+            await ensure_model_cache_schema_compat(session)
             # Mark all existing cache entries as potentially stale before refresh
             await session.execute(
                 ModelCache.__table__.update().values(cache_valid=False)

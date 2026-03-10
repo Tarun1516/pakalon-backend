@@ -26,6 +26,10 @@ import app.models.message  # noqa: F401, E402
 import app.models.telemetry_event  # noqa: F401, E402
 import app.models.model_cache  # noqa: F401, E402
 import app.models.email_queue  # noqa: F401, E402
+import app.models.login_event  # noqa: F401, E402
+import app.models.automation  # noqa: F401, E402
+import app.models.automation_connector  # noqa: F401, E402
+import app.models.automation_log  # noqa: F401, E402
 
 target_metadata = Base.metadata
 

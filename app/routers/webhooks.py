@@ -110,3 +110,122 @@ async def polar_webhook(
 
     await session.commit()
     return {"received": True}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# T-BE-09E — Supabase user lifecycle webhooks
+# Supabase calls this endpoint on user.created and user.updated events.
+# Signature: Authorization: Bearer <SUPABASE_WEBHOOK_SECRET>
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _verify_supabase_webhook_secret(authorization: str | None) -> None:
+    """Validate the shared-secret Bearer token sent by Supabase webhooks."""
+    settings = get_settings()
+    expected = settings.supabase_webhook_secret
+    if not expected:
+        # No secret configured — skip verification (dev/test only)
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing webhook authorization",
+        )
+    token = authorization.removeprefix("Bearer ").strip()
+    import hmac as _hmac  # noqa: PLC0415
+    if not _hmac.compare_digest(token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid webhook secret",
+        )
+
+
+@router.post(
+    "/supabase-auth",
+    status_code=status.HTTP_200_OK,
+    summary="Supabase auth user.created / user.updated webhook",
+)
+async def supabase_auth_webhook(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+):
+    """
+    Receive Supabase Auth webhook events and sync user profile data to PostgreSQL.
+
+    Handled event types (``type`` field in payload):
+    - ``INSERT`` on ``auth.users`` table → create or update user row
+    - ``UPDATE`` on ``auth.users`` table → sync email / display_name / metadata
+    """
+    _verify_supabase_webhook_secret(authorization)
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON body",
+        ) from exc
+
+    event_type: str = payload.get("type", "")         # "INSERT" | "UPDATE"
+    record: dict = payload.get("record") or {}
+
+    supabase_uid: str = record.get("id", "")
+    if not supabase_uid:
+        # Malformed payload — return 200 to prevent Supabase retry storm
+        logger.warning("Supabase auth webhook: no record.id in payload")
+        return {"received": True, "skipped": "no_record_id"}
+
+    raw_user_meta: dict = record.get("raw_user_meta_data") or {}
+    github_login: str | None = (
+        raw_user_meta.get("user_name")
+        or raw_user_meta.get("preferred_username")
+        or raw_user_meta.get("login")
+    )
+    email: str | None = record.get("email") or raw_user_meta.get("email")
+    display_name: str | None = (
+        raw_user_meta.get("full_name")
+        or raw_user_meta.get("name")
+        or github_login
+    )
+
+    if event_type in ("INSERT", "UPDATE"):
+        from sqlalchemy import select as _select  # noqa: PLC0415
+        from app.models.user import User as UserModel  # noqa: PLC0415
+        import uuid as _uuid  # noqa: PLC0415
+        from datetime import datetime, timezone  # noqa: PLC0415
+
+        result = await session.execute(
+            _select(UserModel).where(UserModel.supabase_id == supabase_uid)
+        )
+        user = result.scalar_one_or_none()
+
+        if user is None:
+            # New Supabase user — create a corresponding Pakalon user row
+            user = UserModel(
+                id=str(_uuid.uuid4()),
+                supabase_id=supabase_uid,
+                github_login=github_login or "",
+                email=email or "",
+                display_name=display_name or github_login or "",
+                plan="free",
+                created_at=datetime.now(tz=timezone.utc),
+                account_deleted=False,
+            )
+            session.add(user)
+            logger.info("Supabase webhook: created user for supabase_id=%s", supabase_uid)
+        else:
+            # Existing user — sync mutable profile fields
+            if github_login:
+                user.github_login = github_login
+            if email:
+                user.email = email
+            if display_name:
+                user.display_name = display_name
+            logger.info("Supabase webhook: updated user for supabase_id=%s", supabase_uid)
+
+        await session.flush()
+        await session.commit()
+    else:
+        logger.info("Supabase auth webhook: unhandled event type %s", event_type)
+
+    return {"received": True}

@@ -15,12 +15,21 @@ from app.models.contribution_heatmap import ContributionHeatmap
 from app.models.subscription import Subscription
 from app.models.user import User
 from app.schemas.usage import ContributionDay, DailyLines, DailyTokens, HeatmapResponse, UsageResponse
+from app.services.heatmap_service import get_yearly_contribution_heatmap
 from app.services.trial_abuse import remaining_trial_days
 from app.services.usage_analytics import get_usage_analytics
-from app.services.heatmap_service import get_contribution_heatmap
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/usage", tags=["usage"])
+
+
+def _ensure_utc(value: datetime | None) -> datetime | None:
+    """Normalize DB datetimes so SQLite tests and Postgres behave consistently."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 @router.get(
@@ -44,6 +53,19 @@ async def get_usage(
         )
     )
     active_sub = sub_result.scalar_one_or_none()
+    now = datetime.now(tz=timezone.utc)
+    current_period_start = _ensure_utc(active_sub.period_start) if active_sub else None
+    current_period_end = _ensure_utc(active_sub.period_end) if active_sub else None
+    grace_end = _ensure_utc(active_sub.grace_end) if active_sub else None
+    is_grace_eligible_status = (
+        active_sub is not None
+        and active_sub.status in {"canceled", "revoked", "past_due", "paused", "unpaid"}
+    )
+    is_in_grace_period = bool(
+        is_grace_eligible_status
+        and grace_end is not None
+        and grace_end > now
+    )
 
     analytics = await get_usage_analytics(current_user.id, session)
 
@@ -54,27 +76,17 @@ async def get_usage(
         trial_days_remaining=remaining_trial_days(current_user),
         subscription_id=active_sub.polar_sub_id if active_sub else None,
         subscription_status=active_sub.status if active_sub else None,
-        current_period_start=active_sub.period_start if active_sub else None,
-        current_period_end=active_sub.period_end if active_sub else None,
+        current_period_start=current_period_start,
+        current_period_end=current_period_end,
         days_into_cycle=(
-            (datetime.now(tz=timezone.utc) - active_sub.period_start).days
-            if active_sub and active_sub.period_start else None
+            (now - current_period_start).days
+            if current_period_start else None
         ),
-        is_in_grace_period=(
-            active_sub is not None
-            and active_sub.grace_end is not None
-            and active_sub.grace_end > datetime.now(tz=timezone.utc)
-        )
-        if active_sub
-        else False,
-        grace_period_warning=(
-            active_sub is not None
-            and active_sub.grace_end is not None
-            and active_sub.grace_end > datetime.now(tz=timezone.utc)
-        ),
+        is_in_grace_period=is_in_grace_period,
+        grace_period_warning=is_in_grace_period,
         grace_days_remaining=(
-            max(0, (active_sub.grace_end - datetime.now(tz=timezone.utc)).days)
-            if active_sub and active_sub.grace_end
+            max(0, (grace_end - now).days)
+            if is_in_grace_period and grace_end
             else 0
         ),
         total_tokens=analytics["total_tokens"],
@@ -109,7 +121,7 @@ async def get_heatmap(
     if year is None:
         year = datetime.now(tz=timezone.utc).year
 
-    data = await _get_heatmap(current_user.id, year, session)
+    data = await get_yearly_contribution_heatmap(current_user.id, year, session)
 
     return HeatmapResponse(
         year=data["year"],

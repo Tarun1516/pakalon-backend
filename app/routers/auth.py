@@ -2,11 +2,13 @@
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
 from app.dependencies import get_supabase_user
+from app.config import get_settings
+from app.database import DATABASE_UNAVAILABLE_DETAIL, is_database_unavailable_error
 from app.schemas.auth import (
     DeviceCodeCreateRequest,
     DeviceCodeCreateResponse,
@@ -30,6 +32,99 @@ def _get_redis():
     return redis_client
 
 
+def _parse_user_agent(ua: str | None) -> tuple[str | None, str | None, str | None]:
+    """Return (browser, os, device_name) parsed from a User-Agent string."""
+    if not ua:
+        return None, None, None
+
+    ua_lower = ua.lower()
+
+    # Browser detection (order matters — Edge/OPR must come before Chrome/Safari)
+    browser: str | None = None
+    if "edg/" in ua_lower or "edge/" in ua_lower:
+        browser = "Edge"
+    elif "opr/" in ua_lower or "opera" in ua_lower:
+        browser = "Opera"
+    elif "chrome/" in ua_lower:
+        browser = "Chrome"
+    elif "safari/" in ua_lower:
+        browser = "Safari"
+    elif "firefox/" in ua_lower:
+        browser = "Firefox"
+    elif "msie" in ua_lower or "trident/" in ua_lower:
+        browser = "Internet Explorer"
+    elif "curl" in ua_lower:
+        browser = "curl"
+
+    # OS detection
+    os_name: str | None = None
+    if "windows nt" in ua_lower:
+        os_name = "Windows"
+    elif "mac os x" in ua_lower or "macintosh" in ua_lower:
+        os_name = "macOS"
+    elif "android" in ua_lower:
+        os_name = "Android"
+    elif "iphone" in ua_lower or "ipad" in ua_lower:
+        os_name = "iOS"
+    elif "linux" in ua_lower:
+        os_name = "Linux"
+
+    # Device name — mobile/tablet hint
+    device_name: str | None = None
+    if "iphone" in ua_lower:
+        device_name = "iPhone"
+    elif "ipad" in ua_lower:
+        device_name = "iPad"
+    elif "android" in ua_lower and "mobile" in ua_lower:
+        device_name = "Android Phone"
+    elif "android" in ua_lower:
+        device_name = "Android Tablet"
+    else:
+        device_name = "Desktop"
+
+    return browser, os_name, device_name
+
+
+def _get_client_ip(request: Request) -> str | None:
+    """Extract the real client IP, respecting X-Forwarded-For if present."""
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        ip = forwarded_for.split(",")[0].strip()
+    else:
+        ip = request.client.host if request.client else None
+    if ip and ip.startswith("::ffff:"):
+        ip = ip[7:]
+    return ip or None
+
+
+async def _record_login_event(
+    user_id: str,
+    login_type: str,
+    request: Request,
+    session: AsyncSession,
+    machine_id: str | None = None,
+) -> None:
+    """Persist a LoginEvent row — failure is logged but not propagated."""
+    try:
+        from app.models.login_event import LoginEvent  # noqa: PLC0415
+        ua = request.headers.get("user-agent")
+        browser, os_name, device_name = _parse_user_agent(ua)
+        event = LoginEvent(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            login_type=login_type,
+            ip_address=_get_client_ip(request),
+            user_agent=ua,
+            browser=browser,
+            os=os_name,
+            device_name=device_name,
+            machine_id=machine_id,
+        )
+        session.add(event)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to record login event for user %s: %s", user_id, exc)
+
+
 @router.post(
     "/devices",
     response_model=DeviceCodeCreateResponse,
@@ -47,7 +142,7 @@ async def create_device_code(
     """
     device_id = body.device_id or str(uuid.uuid4())
     try:
-        dc = await device_code_svc.create_device_code(
+        dc, is_first_machine_run, launch_experience = await device_code_svc.create_device_code(
             device_id=device_id,
             machine_id=body.machine_id,
             session=session,
@@ -56,15 +151,26 @@ async def create_device_code(
         await session.commit()
     except Exception as exc:
         logger.exception("Error creating device code: %s", exc)
+        if is_database_unavailable_error(exc):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=DATABASE_UNAVAILABLE_DETAIL,
+            ) from exc
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not create device code",
         ) from exc
 
+    settings = get_settings()
+    verification_url = f"{settings.frontend_url.rstrip('/')}/{device_id}/auth/"
+
     return DeviceCodeCreateResponse(
         device_id=device_id,
         code=dc.code,
         expires_in=device_code_svc.DEVICE_CODE_TTL_SECONDS,
+        verification_url=verification_url,
+        is_first_machine_run=is_first_machine_run,
+        launch_experience=launch_experience,
     )
 
 
@@ -97,7 +203,10 @@ async def poll_device_token(
             token=result.get("token"),
             user_id=result.get("user_id"),
             plan=result.get("plan"),
+            github_login=result.get("github_login"),
+            display_name=result.get("display_name"),
             trial_days_remaining=result.get("trial_days_remaining"),
+            billing_days_remaining=result.get("billing_days_remaining"),
             trial_ends_at=result.get("trial_ends_at"),
         )
 
@@ -119,12 +228,13 @@ async def poll_device_token(
 async def confirm_device_code(
     device_id: str,
     body: DeviceCodeConfirmRequest,
+    request: Request,
     session: AsyncSession = Depends(get_session),
     supabase_payload: dict = Depends(get_supabase_user),
 ):
     """
     The Pakalon website calls this after the user logs in with Supabase GitHub OAuth
-    and enters (or auto-submits) the 6-digit code shown in the CLI.
+    and enters (or auto-submits) the 6-character code shown in the CLI.
 
     Requires a valid Supabase JWT in the Authorization header.
     """
@@ -148,13 +258,14 @@ async def confirm_device_code(
         dc, user = await device_code_svc.confirm_code(
             device_id=device_id,
             code=body.code,
-            clerk_user_id=supabase_user_id,
+            supabase_user_id=supabase_user_id,
             github_login=github_login,
             email=email,
             display_name=display_name,
             session=session,
             redis=_get_redis(),
         )
+        await _record_login_event(user.id, "device_code", request, session, machine_id=dc.machine_id)
         await session.commit()
     except ValueError as exc:
         raise HTTPException(
@@ -179,11 +290,12 @@ async def confirm_device_code(
 async def web_confirm_device_code(
     device_id: str,
     body: DeviceCodeWebConfirmRequest,
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ):
     """
     Called by the web `/[device_id]/auth/` page after the user enters the
-    6-digit code.  No authentication required — a user record is
+    6-character code.  No authentication required — a user record is
     created or looked up by email / github_login.
 
     The CLI polls `/devices/{device_id}/token` concurrently and will receive
@@ -199,6 +311,7 @@ async def web_confirm_device_code(
             session=session,
             redis=_get_redis(),
         )
+        await _record_login_event(user.id, "device_code", request, session, machine_id=_dc.machine_id)
         await session.commit()
     except ValueError as exc:
         raise HTTPException(
@@ -207,6 +320,11 @@ async def web_confirm_device_code(
         ) from exc
     except Exception as exc:
         logger.exception("Error in web_confirm_device_code: %s", exc)
+        if is_database_unavailable_error(exc):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=DATABASE_UNAVAILABLE_DETAIL,
+            ) from exc
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Authentication failed due to a server error",
@@ -232,6 +350,7 @@ async def web_confirm_device_code(
 )
 async def web_signin(
     body: WebSignInRequest,
+    request: Request,
     supabase_payload: dict = Depends(get_supabase_user),
     session: AsyncSession = Depends(get_session),
 ):
@@ -255,14 +374,20 @@ async def web_signin(
     try:
         user = await get_or_create_user_by_github(
             github_login=body.github_login,
-            clerk_id=supabase_user_id,
+            supabase_id=supabase_user_id,
             email=body.email,
             display_name=body.display_name,
             session=session,
         )
+        await _record_login_event(user.id, "web", request, session)
         await session.commit()
     except Exception as exc:
         logger.exception("Error in web_signin: %s", exc)
+        if is_database_unavailable_error(exc):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=DATABASE_UNAVAILABLE_DETAIL,
+            ) from exc
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Sign-in failed due to a server error",

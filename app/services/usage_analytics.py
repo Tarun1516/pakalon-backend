@@ -1,13 +1,25 @@
 """Model usage tracking service (T-BACK-01)."""
+from collections import defaultdict
+from datetime import date
 import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.model_usage import ModelUsage
 
 logger = logging.getLogger(__name__)
+
+
+def _date_key(value: datetime | date | str | None) -> str:
+    """Return a stable YYYY-MM-DD string for usage bucketing across DB backends."""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value or "")
 
 
 async def record_model_usage(
@@ -66,16 +78,28 @@ async def get_remaining_pct(
     based on the most recent usage record (0–100).
     Returns None if no usage exists yet.
     """
-    result = await db.execute(
-        select(ModelUsage)
-        .where(
-            ModelUsage.user_id == user_id,
-            ModelUsage.model_id == model_id,
-            ModelUsage.context_window_size > 0,
+    try:
+        result = await db.execute(
+            select(ModelUsage)
+            .where(
+                ModelUsage.user_id == user_id,
+                ModelUsage.model_id == model_id,
+                ModelUsage.context_window_size > 0,
+            )
+            .order_by(ModelUsage.created_at.desc())
+            .limit(1)
         )
-        .order_by(ModelUsage.created_at.desc())
-        .limit(1)
-    )
+    except (OperationalError, ProgrammingError) as exc:
+        error_text = str(getattr(exc, "orig", exc)).lower()
+        missing_table_markers = (
+            'no such table: model_usage',
+            'relation "model_usage" does not exist',
+            'undefinedtable',
+        )
+        if any(marker in error_text for marker in missing_table_markers):
+            logger.warning("model_usage table is unavailable; returning no context-usage data")
+            return None
+        raise
     row = result.scalar_one_or_none()
     if row is None:
         return None
@@ -164,22 +188,6 @@ async def get_usage_analytics(
         row[0]: int(row[1]) for row in model_result.all()
     }
 
-    # Daily tokens (last 30 days)
-    from sqlalchemy import cast, Date as SQLDate  # noqa: PLC0415
-    daily_result = await db.execute(
-        select(
-            cast(ModelUsage.created_at, SQLDate).label("day"),
-            func.sum(ModelUsage.tokens_used).label("tokens"),
-        )
-        .where(ModelUsage.user_id == user_id)
-        .group_by("day")
-        .order_by("day")
-    )
-    daily_tokens = [
-        {"date": str(row[0]), "tokens": int(row[1])}
-        for row in daily_result.all()
-    ]
-
     # Lines written (total)
     lines_result = await db.execute(
         select(func.coalesce(func.sum(ModelUsage.lines_written), 0)).where(
@@ -188,19 +196,26 @@ async def get_usage_analytics(
     )
     lines_written: int = lines_result.scalar_one()
 
-    # Daily lines written (for contribution heatmap)
-    daily_lines_result = await db.execute(
-        select(
-            cast(ModelUsage.created_at, SQLDate).label("day"),
-            func.sum(ModelUsage.lines_written).label("lines"),
-        )
+    # Daily aggregates are computed in Python for SQLite/Postgres consistency.
+    usage_rows_result = await db.execute(
+        select(ModelUsage.created_at, ModelUsage.tokens_used, ModelUsage.lines_written)
         .where(ModelUsage.user_id == user_id)
-        .group_by("day")
-        .order_by("day")
+        .order_by(ModelUsage.created_at)
     )
+    daily_tokens_map: dict[str, int] = defaultdict(int)
+    daily_lines_map: dict[str, int] = defaultdict(int)
+    for created_at, tokens_used, lines_written_value in usage_rows_result.all():
+        day = _date_key(created_at)
+        daily_tokens_map[day] += int(tokens_used or 0)
+        daily_lines_map[day] += int(lines_written_value or 0)
+
+    daily_tokens = [
+        {"date": day, "tokens": daily_tokens_map[day]}
+        for day in sorted(daily_tokens_map)
+    ]
     daily_lines_written = [
-        {"date": str(row[0]), "lines": int(row[1] or 0)}
-        for row in daily_lines_result.all()
+        {"date": day, "lines": daily_lines_map[day]}
+        for day in sorted(daily_lines_map)
     ]
 
     # Sessions count
