@@ -40,6 +40,12 @@ class ContributionDay(Base):
         nullable=False,
         default=lambda: datetime.now(tz=timezone.utc),
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(tz=timezone.utc),
+        onupdate=lambda: datetime.now(tz=timezone.utc),
+    )
 
     def __repr__(self) -> str:
         return (

@@ -315,8 +315,39 @@ async def test_get_me_unauthenticated(client):
 
 
 @pytest.mark.asyncio
-async def test_get_me_expired_user_forbidden(client, expired_user: User):
+async def test_logout_requires_authentication(client):
+    response = await client.post("/auth/logout")
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_logout_revokes_token_and_blocks_follow_up_requests(client, free_user: User, fake_redis):
+    from app import main as app_main
+
+    token = make_jwt_for_user(free_user)
+    original_redis = app_main.redis_client
+    app_main.redis_client = fake_redis
+
+    try:
+        me_before = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert me_before.status_code == 200
+
+        logout_response = await client.post("/auth/logout", headers={"Authorization": f"Bearer {token}"})
+        assert logout_response.status_code == 200
+        payload = logout_response.json()
+        assert payload["status"] == "ok"
+        assert payload["revoked"] is True
+
+        me_after = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert me_after.status_code == 401
+        assert "logged out" in me_after.json()["detail"].lower()
+    finally:
+        app_main.redis_client = original_redis
+
+
+@pytest.mark.asyncio
+async def test_get_me_expired_user_still_allowed_for_free_tier(client, expired_user: User):
     token = make_jwt_for_user(expired_user)
     response = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
-    # Middleware should block expired trial users
-    assert response.status_code == 403
+    assert response.status_code == 200
+    assert response.json()["plan"] == "free"

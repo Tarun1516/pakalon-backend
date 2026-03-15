@@ -3,6 +3,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
@@ -17,13 +18,16 @@ from app.schemas.auth import (
     DeviceCodePollResponse,
     DeviceCodeWebConfirmRequest,
     DeviceCodeWebConfirmResponse,
+    LogoutResponse,
     WebSignInRequest,
     WebSignInResponse,
 )
 from app.services import device_code as device_code_svc
+from app.middleware.auth import verify_pakalon_jwt, revoke_token
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
+_bearer = HTTPBearer(auto_error=False)
 
 
 def _get_redis():
@@ -399,4 +403,31 @@ async def web_signin(
         user_id=user.id,
         plan=user.plan,
         github_login=user.github_login,
+    )
+
+
+@router.post(
+    "/logout",
+    response_model=LogoutResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Revoke the current Pakalon JWT",
+)
+async def logout(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+):
+    """Invalidate the current JWT token so it cannot be reused after logout."""
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header missing",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = credentials.credentials
+    payload = verify_pakalon_jwt(token)
+    revoked = await revoke_token(token, payload.get("exp"))
+
+    return LogoutResponse(
+        revoked=revoked,
+        message="Logged out. Token revocation persisted." if revoked else "Logged out. Revocation cache unavailable; token will expire naturally.",
     )

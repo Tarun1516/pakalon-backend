@@ -14,8 +14,8 @@ from app.database import DATABASE_UNAVAILABLE_DETAIL, initialize_database_if_nee
 
 logger = logging.getLogger(__name__)
 
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# if sys.platform == "win32":
+#     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Global Redis client — initialized in lifespan
 redis_client = None
@@ -69,13 +69,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "Automation job restoration failed during startup; continuing without scheduled automation rehydration"
         )
 
-    yield  # ← server is running here
+    interrupted = False
+    try:
+        yield  # ← server is running here
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        # Uvicorn/Starlette can cancel lifespan while handling Ctrl+C or
+        # reloader shutdown on Windows. Treat this as graceful shutdown.
+        interrupted = True
+        logger.info("Lifespan interrupted by shutdown signal; completing graceful teardown")
 
     # Shutdown
-    scheduler.shutdown(wait=False)
+    try:
+        if getattr(scheduler, "running", False):
+            scheduler.shutdown(wait=False)
+    except asyncio.CancelledError:
+        logger.info("Scheduler shutdown cancelled during lifespan teardown")
+    except Exception:
+        logger.exception("Scheduler shutdown raised during lifespan teardown")
+
     if redis_client:
-        await redis_client.aclose()
+        try:
+            await redis_client.aclose()
+        except Exception:
+            logger.exception("Redis client close raised during lifespan teardown")
+        finally:
+            redis_client = None
+
     logger.info("APScheduler stopped; backend shutting down")
+
+    if interrupted:
+        return
 
 
 def create_app() -> FastAPI:

@@ -139,7 +139,7 @@ async def get_auto_model(
 
 
 @router.get(
-    "/{model_id}/context",
+    "/{model_id:path}/context",
     summary="Check context window status for a specific model",
 )
 async def get_model_context_status(

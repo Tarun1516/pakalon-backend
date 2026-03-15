@@ -31,10 +31,9 @@ async def get_current_user(
 
     Raises:
         401 — if token is missing, malformed, or invalid
-        403 — if user's trial has expired (free plan, trial_end in the past)
         404 — if user not found in DB (should not happen in normal flow)
     """
-    from app.middleware.auth import verify_pakalon_jwt, get_user_from_token
+    from app.middleware.auth import verify_pakalon_jwt, get_user_from_token, is_token_revoked
 
     if credentials is None:
         raise HTTPException(
@@ -44,6 +43,13 @@ async def get_current_user(
         )
 
     token = credentials.credentials
+    if await is_token_revoked(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been logged out. Please sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     payload = verify_pakalon_jwt(token)  # raises 401 on failure
 
     user = await get_user_from_token(payload, session)
@@ -63,7 +69,7 @@ async def _check_subscription_access(user, session: AsyncSession) -> None:
     from app.models.subscription import Subscription  # noqa: PLC0415
 
     if user.plan != "pro":
-        return  # Free/trial users are handled by trial expiry logic
+        return  # Free users are lifetime-access (restricted to :free models elsewhere)
 
     now = _ensure_utc(datetime.now(tz=timezone.utc))
 

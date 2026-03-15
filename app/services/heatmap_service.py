@@ -100,7 +100,7 @@ async def get_yearly_contribution_heatmap(
             }
 
         # Calculate intensity level
-        total = day["lines_added"] + day["commits"] + day["sessions_count"]
+        total = day["lines_added"] + day["commits"] + day["sessions_count"] + (1 if day["tokens_used"] > 0 else 0)
         day["level"] = _calculate_level(total)
 
         all_days.append(day)
@@ -157,6 +157,7 @@ async def get_contribution_heatmap(
                 contribution.lines_added
                 + contribution.commits
                 + contribution.sessions_count
+                + (1 if contribution.tokens_used > 0 else 0)
             )
         window_days.append(
             HeatmapWindowDay(
@@ -183,7 +184,7 @@ async def update_contribution_day(
     Update contribution data for today.
     Called after sessions end or model usage is recorded.
     """
-    today = date.today()
+    today = datetime.now(tz=timezone.utc).date()
 
     # Check if entry exists
     result = await db.execute(
@@ -212,4 +213,4 @@ async def update_contribution_day(
         )
         db.add(new_contrib)
 
-    await db.commit()
+    await db.flush()

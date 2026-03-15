@@ -98,3 +98,11 @@ class WebSignInResponse(BaseModel):
     user_id: str
     plan: str
     github_login: str
+
+
+class LogoutResponse(BaseModel):
+    """Response payload for backend token logout/revocation."""
+
+    status: Literal["ok"] = "ok"
+    revoked: bool = Field(..., description="True when token revocation state was persisted")
+    message: str = Field(..., description="Human-readable logout status message")

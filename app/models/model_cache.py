@@ -1,9 +1,10 @@
 """ModelCache ORM model — cached OpenRouter model metadata."""
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import JSON, Boolean, DateTime, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -22,7 +23,10 @@ class ModelCache(Base):
     context_length: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # free | paid
     tier: Mapped[str] = mapped_column(String(20), nullable=False, default="paid")
-    raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+    )
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

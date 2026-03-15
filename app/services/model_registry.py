@@ -38,6 +38,29 @@ PLAN_MODEL_TIERS = {
 }
 
 
+def _extract_context_length(model_data: dict[str, Any]) -> int:
+    """Return a normalized context length regardless of upstream field spelling."""
+    raw_value = model_data.get("context_length", model_data.get("context_window", 0))
+    try:
+        return int(raw_value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _deserialize_raw_json(raw_json: Any) -> dict[str, Any]:
+    """Handle both legacy TEXT payloads and JSON/JSONB ORM payloads."""
+    if isinstance(raw_json, dict):
+        return raw_json
+    if not raw_json:
+        return {}
+    if isinstance(raw_json, str):
+        try:
+            return json.loads(raw_json)
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
 async def ensure_model_cache_schema_compat(session: AsyncSession) -> set[str]:
     """Upgrade older model_cache table layouts in-place before ORM queries run."""
 
@@ -147,36 +170,40 @@ async def cache_models(models: list[dict[str, Any]], session: AsyncSession) -> N
     """Upsert model records in the database."""
     await ensure_model_cache_schema_compat(session)
     now = datetime.now(tz=timezone.utc)
+    existing_rows = await session.execute(select(ModelCache))
+    cached_by_model_id = {
+        cached.model_id: cached
+        for cached in existing_rows.scalars().all()
+    }
+
     for model_data in models:
         model_id = model_data.get("id", "")
         if not model_id:
             continue
         tier = _classify_model(model_data)
-
-        result = await session.execute(
-            select(ModelCache).where(ModelCache.model_id == model_id)
-        )
-        cached = result.scalar_one_or_none()
+        cached = cached_by_model_id.get(model_id)
 
         model_created_at = _parse_openrouter_created(model_data)
+        context_length = _extract_context_length(model_data)
 
         if cached is None:
             cached = ModelCache(
                 model_id=model_id,
                 name=model_data.get("name", model_id),
-                context_length=model_data.get("context_length", 0),
+                context_length=context_length,
                 tier=tier,
-                raw_json=json.dumps(model_data),
+                raw_json=model_data,
                 fetched_at=now,
                 model_created_at=model_created_at,
                 cache_valid=True,  # Newly fetched models are valid
             )
             session.add(cached)
+            cached_by_model_id[model_id] = cached
         else:
             cached.name = model_data.get("name", model_id)
-            cached.context_length = model_data.get("context_length", 0)
+            cached.context_length = context_length
             cached.tier = tier
-            cached.raw_json = json.dumps(model_data)
+            cached.raw_json = model_data
             cached.fetched_at = now
             cached.cache_valid = True  # Mark as valid after successful refresh
             # Always refresh model_created_at in case OpenRouter back-fills it
@@ -206,6 +233,7 @@ async def get_models_for_plan(
         .where(ModelCache.tier.in_(tiers))
         .order_by(
             nullslast(ModelCache.model_created_at.desc()),
+            ModelCache.fetched_at.desc(),
             ModelCache.context_length.desc(),
         )
     )
@@ -216,10 +244,7 @@ async def get_models_for_plan(
 
     models_list = []
     for m in cached_models:
-        try:
-            raw = json.loads(m.raw_json) if m.raw_json else {}
-        except json.JSONDecodeError:
-            raw = {}
+        raw = _deserialize_raw_json(m.raw_json)
         models_list.append(
             {
                 "id": m.model_id,

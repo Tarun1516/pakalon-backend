@@ -1,4 +1,5 @@
 """Pakalon JWT authentication middleware and helpers."""
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -11,6 +12,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _get_redis():
+    """Lazily resolve the shared Redis client to avoid import cycles."""
+    from app.main import redis_client  # noqa: PLC0415
+
+    return redis_client
+
+
+def _token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _ensure_utc(value: datetime) -> datetime:
@@ -51,6 +63,37 @@ def verify_pakalon_jwt(token: str) -> dict[str, Any]:
         )
 
 
+async def is_token_revoked(token: str) -> bool:
+    """Check whether a JWT has been explicitly revoked (logout)."""
+    redis = _get_redis()
+    if redis is None:
+        return False
+    try:
+        key = f"revoked_token:{_token_fingerprint(token)}"
+        return bool(await redis.get(key))
+    except Exception:
+        # Redis outages should not hard-block API auth checks.
+        return False
+
+
+async def revoke_token(token: str, exp_claim: int | float | None) -> bool:
+    """Mark a JWT as revoked in Redis until it would naturally expire."""
+    redis = _get_redis()
+    if redis is None:
+        return False
+
+    now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+    exp_ts = int(exp_claim) if exp_claim is not None else (now_ts + 86_400)
+    ttl_seconds = max(60, exp_ts - now_ts)
+
+    try:
+        key = f"revoked_token:{_token_fingerprint(token)}"
+        await redis.setex(key, ttl_seconds, "1")
+        return True
+    except Exception:
+        return False
+
+
 async def get_user_from_token(payload: dict[str, Any], session: AsyncSession):
     """
     Look up the user record for the JWT subject.
@@ -58,7 +101,6 @@ async def get_user_from_token(payload: dict[str, Any], session: AsyncSession):
     Raises:
         401 — user not found in DB
         403 — account deleted
-        403 — free trial expired
         403 — pro subscription grace period expired (past grace_end)
     """
     from app.models.user import User  # local import to avoid circular
@@ -87,14 +129,6 @@ async def get_user_from_token(payload: dict[str, Any], session: AsyncSession):
         )
 
     now = _ensure_utc(datetime.now(tz=timezone.utc))
-
-    # Check trial expiry for free users
-    if user.plan == "free" and user.trial_end is not None:
-        if _ensure_utc(user.trial_end) < now:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Free trial has expired. Visit pakalon.com/pricing to upgrade.",
-            )
 
     # T-BACK-06: Grace period enforcement for pro users
     # If a pro user's subscription has expired, check grace_end.

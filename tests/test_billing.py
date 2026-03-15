@@ -13,6 +13,12 @@ from app.services.billing import (
 )
 
 
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 @pytest.mark.asyncio
 async def test_checkout_requires_auth(client):
     response = await client.post("/billing/checkout", json={})
@@ -77,4 +83,4 @@ async def test_polar_subscription_revoked_sets_grace_period(db_session, pro_user
     await db_session.refresh(sub)
     assert sub.status == "past_due"
     assert sub.grace_end is not None
-    assert sub.grace_end > datetime.now(tz=timezone.utc)
+    assert _as_utc(sub.grace_end) > datetime.now(tz=timezone.utc)

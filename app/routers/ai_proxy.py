@@ -33,15 +33,30 @@ from app.services.usage_analytics import (
     is_context_exhausted,
     record_model_usage,
     get_remaining_pct,
-    get_context_status,
 )
-from app.services.rate_limit import check_rate_limit, rate_limit_headers, FREE_LIMIT, PRO_LIMIT
 from app.services.model_registry import get_model_context_window
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ai", tags=["ai-proxy"])
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+
+
+def _coerce_openrouter_content(content: object) -> str:
+    """Normalize OpenRouter content payloads into a plain string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text_part = item.get("text")
+                if isinstance(text_part, str):
+                    parts.append(text_part)
+        return "".join(parts)
+    return ""
 
 # ---------------------------------------------------------------------------
 # Request / Response schemas
@@ -243,7 +258,14 @@ async def ai_chat(
                 json=payload,
             )
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                logger.error("OpenRouter returned invalid JSON payload: %s", resp.text[:1000])
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="Upstream AI provider returned an invalid response",
+                ) from exc
     except httpx.HTTPStatusError as exc:
         logger.error("OpenRouter error %s: %s", exc.response.status_code, exc.response.text)
         raise HTTPException(
@@ -256,7 +278,10 @@ async def ai_chat(
             detail="AI provider timed out",
         )
 
-    content = data["choices"][0]["message"]["content"] or ""
+    choices = data.get("choices") or []
+    first_choice = choices[0] if choices else {}
+    message = first_choice.get("message", {}) if isinstance(first_choice, dict) else {}
+    content = _coerce_openrouter_content(message.get("content"))
     usage = data.get("usage", {})
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
@@ -265,20 +290,27 @@ async def ai_chat(
     ctx_window = await get_model_context_window(model, db)
     total_tokens = prompt_tokens + completion_tokens
 
-    # Record usage
-    await record_model_usage(
-        user_id=current_user.id,
-        session_id=body.session_id,
-        model_id=model,
-        tokens_used=total_tokens,
-        context_window_size=ctx_window,
-        context_window_used=prompt_tokens,
-        lines_written=body.lines_delta or 0,
-        db=db,
-    )
-    await db.commit()
+    # Record usage (best-effort; completion should still return even if usage writes fail)
+    try:
+        await record_model_usage(
+            user_id=current_user.id,
+            session_id=body.session_id,
+            model_id=model,
+            tokens_used=total_tokens,
+            context_window_size=ctx_window,
+            context_window_used=prompt_tokens,
+            lines_written=body.lines_delta or 0,
+            db=db,
+        )
+        await db.commit()
+    except Exception as exc:
+        logger.warning("Usage record failed after non-stream response: %s", exc)
 
-    remaining = await get_remaining_pct(current_user.id, model, db)
+    try:
+        remaining = await get_remaining_pct(current_user.id, model, db)
+    except Exception as exc:
+        logger.warning("Remaining context fetch failed: %s", exc)
+        remaining = None
 
     return AIChatResponse(
         content=content,
@@ -385,12 +417,16 @@ async def ai_chat_stream(
                         except json.JSONDecodeError:
                             continue
 
+                        if chunk_data.get("error"):
+                            detail = chunk_data["error"].get("message") if isinstance(chunk_data["error"], dict) else str(chunk_data["error"])
+                            yield f"data: {json.dumps({'type': 'error', 'detail': detail})}\n\n"
+                            return
+
                         # Extract text delta
-                        delta = (
-                            chunk_data.get("choices", [{}])[0]
-                            .get("delta", {})
-                            .get("content", "")
-                        ) or ""
+                        choices = chunk_data.get("choices") or []
+                        first_choice = choices[0] if choices else {}
+                        delta_obj = first_choice.get("delta", {}) if isinstance(first_choice, dict) else {}
+                        delta = _coerce_openrouter_content(delta_obj.get("content"))
                         if delta:
                             full_content += delta
                             yield f"data: {json.dumps({'type': 'chunk', 'content': delta})}\n\n"

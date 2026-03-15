@@ -101,6 +101,15 @@ async def test_pro_plan_gets_all_models(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cached_model_payload_round_trips_json_fields(db_session):
+    await cache_models([SAMPLE_FREE_MODEL], db_session)
+    await db_session.commit()
+
+    free_models = await get_models_for_plan("free", db_session)
+    assert free_models[0]["pricing"] == SAMPLE_FREE_MODEL["pricing"]
+
+
+@pytest.mark.asyncio
 async def test_free_plan_can_request_full_catalog(db_session):
     models = [SAMPLE_FREE_MODEL, SAMPLE_PAID_MODEL]
     await cache_models(models, db_session)
@@ -144,6 +153,7 @@ async def test_legacy_model_cache_schema_is_upgraded_in_place():
         assert [model["id"] for model in free_models] == [SAMPLE_FREE_MODEL["id"]]
         assert free_models[0]["context_length"] == SAMPLE_FREE_MODEL["context_length"]
         assert free_models[0]["tier"] == "free"
+        assert free_models[0]["pricing"] == SAMPLE_FREE_MODEL["pricing"]
 
         row = (
             await session.execute(
@@ -198,6 +208,21 @@ async def test_list_models_include_all_returns_full_catalog(client, free_user, d
     ids = [model["id"] for model in response.json()["models"]]
     assert SAMPLE_FREE_MODEL["id"] in ids
     assert SAMPLE_PAID_MODEL["id"] in ids
+
+
+@pytest.mark.asyncio
+async def test_model_context_status_accepts_slash_model_ids(client, free_user):
+    from tests.conftest import make_jwt_for_user
+
+    token = make_jwt_for_user(free_user)
+    response = await client.get(
+        f"/models/{SAMPLE_FREE_MODEL['id']}/context",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model_id"] == SAMPLE_FREE_MODEL["id"]
+    assert response.json()["exhausted"] is False
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.model_usage import ModelUsage
+from app.services.heatmap_service import update_contribution_day
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,13 @@ async def record_model_usage(
     )
     db.add(record)
     await db.flush()
+
+    await update_contribution_day(
+        user_id=user_id,
+        db=db,
+        lines_added=max(0, int(lines_written or 0)),
+        tokens_used=max(0, int(tokens_used or 0)),
+    )
 
     # Publish to Redis for real-time context updates
     try:

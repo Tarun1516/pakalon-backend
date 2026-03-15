@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -19,6 +20,9 @@ from sqlalchemy.orm import DeclarativeBase
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+_resolved_database_url_cache: str | None = None
+_fallback_warning_emitted = False
 
 DATABASE_UNAVAILABLE_DETAIL = (
     "Pakalon could not reach its configured database. Start Docker Desktop or point "
@@ -50,7 +54,63 @@ def _tcp_endpoint_is_reachable(hostname: str, port: int, timeout: float = 0.35) 
         return False
 
 
+def _credentials_accept_connections(database_url: str, timeout_seconds: float = 1.0) -> bool:
+    """Best-effort credential check for local PostgreSQL in development.
+
+    This prevents a noisy failure mode where localhost Postgres is reachable on TCP
+    but rejects the configured username/password, which would otherwise generate 500s
+    for every authenticated request.
+    """
+    try:
+        parsed = make_url(database_url)
+    except Exception:
+        return True
+
+    driver_name = str(parsed.drivername)
+    if not driver_name.startswith("postgresql"):
+        return True
+
+    host = parsed.host
+    port = parsed.port or 5432
+    if not host or not _is_local_database_host(host):
+        return True
+
+    try:
+        import psycopg
+    except Exception:
+        # If psycopg is unavailable, don't block startup decisions here.
+        return True
+
+    connect_kwargs: dict[str, object] = {
+        "host": host,
+        "port": port,
+        "dbname": parsed.database or "postgres",
+        "connect_timeout": max(1, int(timeout_seconds)),
+    }
+    if parsed.username:
+        connect_kwargs["user"] = parsed.username
+    if parsed.password:
+        connect_kwargs["password"] = parsed.password
+
+    sslmode = parsed.query.get("sslmode") if parsed.query else None
+    if sslmode:
+        connect_kwargs["sslmode"] = sslmode
+
+    try:
+        with psycopg.connect(**connect_kwargs) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
 def resolve_effective_database_url() -> str:
+    global _resolved_database_url_cache, _fallback_warning_emitted
+
+    if _resolved_database_url_cache is not None:
+        return _resolved_database_url_cache
+
     settings = get_settings()
     database_url = settings.database_url
 
@@ -59,28 +119,53 @@ def resolve_effective_database_url() -> str:
         or not settings.development_allow_sqlite_fallback
         or is_sqlite_database_url(database_url)
     ):
+        _resolved_database_url_cache = database_url
         return database_url
 
     parsed = urlsplit(database_url)
     hostname = parsed.hostname
     port = parsed.port
     if not hostname or not port or not _is_local_database_host(hostname):
+        _resolved_database_url_cache = database_url
         return database_url
 
     if _tcp_endpoint_is_reachable(hostname, port):
-        return database_url
+        if _credentials_accept_connections(database_url):
+            _resolved_database_url_cache = database_url
+            return database_url
+
+        fallback_url = settings.development_database_fallback_url
+        if is_sqlite_database_url(fallback_url):
+            sqlite_path = fallback_url.replace("sqlite+aiosqlite:///", "", 1)
+            Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
+
+        if not _fallback_warning_emitted:
+            logger.warning(
+                "Database at %s:%s rejected configured credentials; using development SQLite fallback at %s",
+                hostname,
+                port,
+                fallback_url,
+            )
+            _fallback_warning_emitted = True
+
+        _resolved_database_url_cache = fallback_url
+        return fallback_url
 
     fallback_url = settings.development_database_fallback_url
     if is_sqlite_database_url(fallback_url):
         sqlite_path = fallback_url.replace("sqlite+aiosqlite:///", "", 1)
         Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
 
-    logger.warning(
-        "Database at %s:%s is unreachable; using development SQLite fallback at %s",
-        hostname,
-        port,
-        fallback_url,
-    )
+    if not _fallback_warning_emitted:
+        logger.warning(
+            "Database at %s:%s is unreachable; using development SQLite fallback at %s",
+            hostname,
+            port,
+            fallback_url,
+        )
+        _fallback_warning_emitted = True
+
+    _resolved_database_url_cache = fallback_url
     return fallback_url
 
 
@@ -104,6 +189,11 @@ def normalize_async_database_url(database_url: str) -> str:
         )
 
     return database_url
+
+
+def is_local_development_sqlite() -> bool:
+    settings = get_settings()
+    return settings.is_development and is_sqlite_database_url(ACTIVE_DATABASE_URL)
 
 
 def is_database_unavailable_error(exc: BaseException) -> bool:
